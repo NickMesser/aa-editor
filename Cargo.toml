@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aa-editor"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,9 +14,12 @@ aa-dev = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca9
 aa-cry = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
 aa-anim = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
 aa-world = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-ui = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-lua = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
 
 bevy = { version = "0.20", default-features = false, features = ["2d", "3d", "ui", "dds", "tga", "jpeg"] }
 anyhow = "1"
+mlua = { version = "0.12", features = ["lua51", "vendored"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Bevy's recommended dev setup: our code lightly optimised, dependencies fully optimised.

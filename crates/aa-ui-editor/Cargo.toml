@@ -1,0 +1,16 @@
+[package]
+name = "aa-ui-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Editor for the ArcheAge 1.2 Lua UI: live screens, widget inspector, script editor that compiles back to .alb"
+
+[dependencies]
+bevy = { workspace = true, features = ["png"] }
+bevy_egui = { version = "0.43", default-features = false, features = ["render", "default_fonts"] }
+aa-dev.workspace = true
+aa-pak.workspace = true
+aa-lua.workspace = true
+aa-ui.workspace = true
+mlua.workspace = true
+anyhow.workspace = true
