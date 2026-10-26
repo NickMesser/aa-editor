@@ -57,9 +57,16 @@ impl RowEdit {
 pub struct UiArea {
     rects: Vec<egui::Rect>,
     egui_wants_pointer: bool,
+    /// The 3D view left between the panels (logical points).
+    pub view: Option<egui::Rect>,
 }
 
 impl UiArea {
+    /// Another panel rectangle (logical points) the world tools must ignore.
+    pub fn add(&mut self, r: egui::Rect, pixels_per_point: f32) {
+        self.rects.push(egui::Rect::from_min_max((r.min.to_vec2() * pixels_per_point).to_pos2(), (r.max.to_vec2() * pixels_per_point).to_pos2()));
+    }
+
     pub fn contains(&self, logical: Vec2) -> bool {
         self.egui_wants_pointer || self.rects.iter().any(|r| r.contains(egui::pos2(logical.x, logical.y)))
     }
@@ -111,6 +118,8 @@ pub(crate) fn panels(
     cam: Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
     mut area: ResMut<UiArea>,
     mut preview: ResMut<ModelPreview>,
+    worlds: Res<crate::worlds::Worlds>,
+    (mut paths, housing): (Option<ResMut<crate::paths::AiPaths>>, Option<Res<crate::housing::Housing>>),
     mut fonts: Local<bool>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -144,10 +153,12 @@ pub(crate) fn panels(
     );
     let ppp = ctx.pixels_per_point();
     let mut push = |r: egui::Rect| area.rects.push(egui::Rect::from_min_max((r.min.to_vec2() * ppp).to_pos2(), (r.max.to_vec2() * ppp).to_pos2()));
-    push(menu_bar(&mut root, &mut editor, &mut store, &heights, &mut preview, fps));
+    let unsaved_paths = paths.as_ref().map_or(0, |p| p.changed_count()) + housing.as_ref().map_or(0, |h| h.changed_count());
+    push(menu_bar(&mut root, &mut editor, &mut store, &heights, &mut preview, &worlds, unsaved_paths, fps));
     push(status_bar(&mut root, &editor, &store, &heights, &cursor, &cam));
     push(browser(&mut root, &mut editor, &game, &mut preview));
-    push(inspector(&mut root, &mut editor, &mut store, &game, &mut brush, &mut clock, &mut speed));
+    push(inspector(&mut root, &mut editor, &mut store, &game, &mut brush, &mut clock, &mut speed, paths.as_deref_mut()));
+    area.view = Some(root.available_rect_before_wrap());
     row_editor(ctx, &mut editor, &mut game, &store, &mut preview);
     labels(ctx, &editor, &store, &game, &cursor, &cam);
     Ok(())
@@ -164,19 +175,25 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, heights: &Heights, preview: &mut ModelPreview, fps: f64) -> egui::Rect {
+#[allow(clippy::too_many_arguments)]
+fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, heights: &Heights, preview: &mut ModelPreview, worlds: &crate::worlds::Worlds, unsaved_paths: usize, fps: f64) -> egui::Rect {
     egui::Panel::top("menu").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Save all  (Ctrl+S)").clicked() {
-                    editor.requests.push(Request::SaveSpawns);
-                    editor.requests.push(Request::SaveTerrain);
+                    editor.requests.extend([Request::SaveSpawns, Request::SaveTerrain, Request::SaveObjects, Request::SavePaths, Request::SaveHousing]);
                 }
                 if ui.button("Save spawns → server data").clicked() {
                     editor.requests.push(Request::SaveSpawns);
                 }
                 if ui.button("Save terrain → pak overlay").clicked() {
                     editor.requests.push(Request::SaveTerrain);
+                }
+                if ui.button("Save AI paths → server data").clicked() {
+                    editor.requests.push(Request::SavePaths);
+                }
+                if ui.button("Save housing zones → overlay, server, database").clicked() {
+                    editor.requests.push(Request::SaveHousing);
                 }
                 ui.separator();
                 ui.label(format!("Spawns: {}", editor.paths.spawn_dir.display()));
@@ -197,8 +214,12 @@ fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, he
                     editor.requests.push(Request::UndoTerrain);
                 }
             });
+            crate::worlds::menu(ui, editor, worlds);
+            if ui.button("🗺 Teleport (M)").on_hover_text("A map to click on, zones, portals, bookmarks, NPCs by name, coordinates").clicked() {
+                editor.requests.push(Request::OpenTeleport);
+            }
             ui.separator();
-            for (mode, label) in [(Mode::Select, "Select (1)"), (Mode::Place, "Place (2)"), (Mode::Terrain, "Terrain (3)"), (Mode::Objects, "Objects (4)")] {
+            for (mode, label) in [(Mode::Select, "Select (1)"), (Mode::Place, "Place (2)"), (Mode::Terrain, "Terrain (3)"), (Mode::Objects, "Objects (4)"), (Mode::Paths, "Paths (5)"), (Mode::Housing, "Housing (6)")] {
                 if ui.selectable_label(editor.mode == mode, label).clicked() {
                     editor.mode = mode;
                 }
@@ -214,7 +235,7 @@ fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, he
                 preview.open = !preview.open;
             }
             ui.separator();
-            let unsaved = store.changed_count() + heights.unsaved.len();
+            let unsaved = store.changed_count() + heights.unsaved.len() + unsaved_paths;
             if unsaved > 0 {
                 ui.colored_label(egui::Color32::from_rgb(255, 170, 60), format!("● {unsaved} unsaved"));
             }
@@ -332,6 +353,7 @@ fn inspector(
     brush: &mut Brush,
     clock: &mut WorldClock,
     speed: &mut FlySpeed,
+    paths: Option<&mut crate::paths::AiPaths>,
 ) -> egui::Rect {
     egui::Panel::right("inspector").resizable(true).default_size(310.0).show(root, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -350,15 +372,16 @@ fn inspector(
                         }
                     }
                 }
-                Mode::Select | Mode::Objects => {}
+                Mode::Select | Mode::Objects | Mode::Paths | Mode::Housing => {}
             }
             ui.separator();
-            selection_panel(ui, editor, store, game);
+            selection_panel(ui, editor, store, game, paths);
             ui.separator();
             ui.collapsing("View", |ui| {
                 ui.add(egui::Slider::new(&mut editor.view_radius, 50.0..=600.0).text("spawn radius (m)"));
                 ui.checkbox(&mut editor.show_npcs, "NPCs");
                 ui.checkbox(&mut editor.show_doodads, "Doodads");
+                ui.checkbox(&mut editor.fog, "Fog").on_hover_text("The zone's time of day fog. Some instances (arche_mall_world, instance_hadir_farm) are authored with a dense one.");
                 ui.checkbox(&mut editor.snap_to_ground, "Snap moved spawns to the ground");
                 ui.add(egui::Slider::new(&mut clock.hour, 0.0..=24.0).text("time of day"));
                 ui.add(egui::Slider::new(&mut speed.0, 2.0..=2000.0).logarithmic(true).text("fly speed (m/s)"));
@@ -368,7 +391,8 @@ fn inspector(
                     "Right mouse: look · WASD/Space/Q/E: fly (Shift fast)\n\
                      Left click: select · drag: move · [ ]: turn 15° · Shift+wheel: turn 5°\n\
                      Del: delete · Ctrl+D: duplicate · F: focus · Ctrl+Z/Y: undo/redo\n\
-                     1/2/3: select/place/terrain · Ctrl+S: save all · F5: play",
+                     1-5: select/place/terrain/objects/paths · Ctrl+S: save all · F5: play\n\
+                     M: teleport map · top-right gizmo: drag to orbit, click an axis to look along it",
                 );
             });
         });
@@ -447,7 +471,7 @@ fn terrain_panel(ui: &mut egui::Ui, brush: &mut Brush) {
     ui.small("Saved as heightmap.dat (heights, surface types, holes) and cover.ctc (tint) into the pak overlay (the editor and the client read it through AA_PAK_OVERLAY).");
 }
 
-fn selection_panel(ui: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, game: &GameData) {
+fn selection_panel(ui: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, game: &GameData, paths: Option<&mut crate::paths::AiPaths>) {
     ui.heading("Selection");
     let Some(i) = editor.selected.filter(|&i| i < store.spawns.len() && !store.spawns[i].now.deleted) else {
         ui.label("Nothing selected. Click a spawn marker or model.");
@@ -493,6 +517,11 @@ fn selection_panel(ui: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStor
     });
     if p != before {
         store.apply_continued(vec![(i, p)]);
+    }
+    if kind == Kind::Npc
+        && let Some(paths) = paths
+    {
+        crate::paths::spawn_section(ui, editor, store, paths, i);
     }
     ui.horizontal_wrapped(|ui| {
         if ui.button("Focus (F)").clicked() {

@@ -16,5 +16,6 @@ aa-world.workspace = true
 rusqlite.workspace = true
 anyhow.workspace = true
 roxmltree = "0.21"
+spade = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

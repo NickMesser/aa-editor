@@ -45,6 +45,8 @@ pub enum Subject {
     Doodad(u32),
     Item(u32),
     Quest(u32),
+    /// A static world object's model (Objects mode selection): index into [`ModelPreview::models`].
+    Model(u32),
 }
 
 impl Subject {
@@ -63,6 +65,7 @@ impl Subject {
             Subject::Doodad(id) => (Table::Doodads, id),
             Subject::Item(id) => (Table::Items, id),
             Subject::Quest(id) => (Table::Quests, id),
+            Subject::Model(_) => (Table::Doodads, 0),
         }
     }
 
@@ -123,6 +126,20 @@ pub struct ModelPreview {
     auto_rotate: bool,
     race: Race,
     gender: Gender,
+    /// Model files of [`Subject::Model`].
+    models: Vec<String>,
+    last_object: Option<String>,
+}
+
+impl ModelPreview {
+    /// The subject showing a model file.
+    pub fn model(&mut self, path: &str) -> Subject {
+        let i = self.models.iter().position(|m| m == path).unwrap_or_else(|| {
+            self.models.push(path.to_string());
+            self.models.len() - 1
+        });
+        Subject::Model(i as u32)
+    }
 }
 
 #[derive(Component)]
@@ -137,7 +154,8 @@ struct PreviewModel;
 pub fn plugin(app: &mut App) {
     let subject = crate::arg("--preview").and_then(|s| Subject::parse(&s));
     app.insert_resource(ModelPreview {
-        open: subject.is_some(),
+        // `--preview-open`: the window open at start, following the selection
+        open: subject.is_some() || crate::flag("--preview-open"),
         follow: true,
         hover: None,
         request: subject,
@@ -159,6 +177,8 @@ pub fn plugin(app: &mut App) {
         auto_rotate: true,
         race: Race::Nuian,
         gender: Gender::Female,
+        models: Vec::new(),
+        last_object: None,
     })
     .add_systems(Startup, setup)
     .add_systems(Update, (choose, spawn, load_icon, layers, fit, place_camera).chain())
@@ -196,7 +216,30 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut textures
 
 /// Picks the subject: an explicit request, else a row the pointer rests on, a newly opened row editor row or a newly
 /// selected spawn.
-fn choose(mut preview: ResMut<ModelPreview>, editor: Res<Editor>, store: Res<SpawnStore>, time: Res<Time>) {
+fn choose(
+    mut preview: ResMut<ModelPreview>,
+    editor: Res<Editor>,
+    store: Res<SpawnStore>,
+    objs: Res<crate::world_objects::WorldObjects>,
+    state: Res<aa_world::objects::ObjectState>,
+    time: Res<Time>,
+) {
+    // the model of the selected world object (Objects mode)
+    let object = objs.selected.and_then(|part| {
+        let cell = objs.cells.get(&part.cell)?;
+        let m = cell.model(part.kind, part.index, state.vegetation_groups().map(|g| &**g));
+        let m = m.split(" (").next().unwrap_or(&m).trim().to_string();
+        (!m.is_empty() && !m.starts_with("vegetation group")).then_some(m)
+    });
+    let new_object = object.clone().filter(|o| preview.last_object.as_ref() != Some(o));
+    preview.last_object = object;
+    if preview.follow
+        && let Some(m) = new_object
+    {
+        let s = preview.model(&m);
+        preview.subject = Some(s);
+        return;
+    }
     let p = &mut *preview;
     if let Some(s) = p.request.take() {
         p.subject = Some(s);
@@ -272,11 +315,19 @@ fn spawn(
         Subject::Doodad(_) => "Doodad",
         Subject::Item(_) => "Item",
         Subject::Quest(_) => "Quest",
+        Subject::Model(_) => "World object",
     };
-    let mut note = format!("{kind} {id} {name}");
+    let mut note = match subject {
+        Subject::Model(i) => format!("{kind}\n{}", p.models.get(i as usize).cloned().unwrap_or_default()),
+        _ => format!("{kind} {id} {name}"),
+    };
     let mut scale = 1.0;
     let model = match subject {
         Subject::Npc(id) => spawn_npc(&mut commands, &mut previewer, &mut game, id, &mut note, &mut scale),
+        Subject::Model(i) => match p.models.get(i as usize).cloned() {
+            Some(path) => previewer.spawn_npc(&mut commands, &path, None),
+            None => None,
+        },
         Subject::Doodad(id) => match game.doodad_model(id) {
             Some(reference) => {
                 note.push_str(&format!("\n{reference}"));

@@ -21,6 +21,8 @@ cargo test -p aa-editor
 | New objects; decals, roads, water volumes, interior brushes | the same files plus `statobjs.dat` and `visareas.dat` | the same overlay folder (see "More objects") |
 | New surface types of a cell | the cell's `leveldata.xml` | `<overlay>/worlds/<world>/cells/XXX_YYY/client/leveldata.xml` (see "Adding surface types") |
 | Server navmesh heights | `game/worlds/<world>/paths/XXX_YYY/*.bai` from the pak | with "Export terrain to server": `<server-data>/ClientOverlay/game/worlds/...` and `<overlay>/worlds/...` (see "Server terrain") |
+| Housing zones (where players may build) and their rule sets | the zones' `game/worlds/<world>/level_design/zone/<key>/client/housing_area.xml` (pak plus overlay) and the database's `housing_areas`, `housing_groups`, `housing_group_categories` | the changed zone files in the pak overlay and `<server-data>/ClientOverlay/game/worlds/...` (first overwrite keeps `.editor-orig`; the overlay is registered in the server config), the rules in the database (see "Housing zones") |
+| AI paths (the routes NPCs walk) and which NPC follows which | the server's `Data/Path/*.path` (`--path-dir`, default `Data/Path` next to the spawn folder's `Data/Worlds`) and the spawns' `FollowPath` | the same folder (first overwrite or removal keeps `<name>.path.editor-orig`), copied to the mirrors' `Path` folders; `FollowPath` is saved with the spawns (see "AI paths") |
 
 The server loads spawns and game data once, at startup. Restart the lane's game server after saving.
 
@@ -89,13 +91,39 @@ navmesh triangles / nodes first, so the editor moves the navmesh with the ground
 * Only changed files are written, lowercase, to `<server-data>/ClientOverlay/game/worlds/<world>/paths/XXX_YYY/` and to
   the pak overlay (so a pak export carries them), each with `.editor-orig` when a file is overwritten the first time.
   Everything except the patched Z / radius fields stays byte-identical (checked: 0 other bytes differ).
-* **Not updated:** the navmesh's topology. No triangles, nodes or links are added or removed, `areasmission*.bai`
-  is not touched, and walls / slopes you sculpt do not block paths. Raised ground with no navmesh under it stays
-  unwalkable for A*, and a cliff sculpted across a navmesh still has links across it. For large reshaping set
-  `GeoDataMode` to `false` (NPCs then use the heightmap and lose A* pathing).
-* Status line: "Navmesh: N file(s), P point(s) moved, K off the ground kept, L link(s) blocked over holes".
-  Tests `navmesh::tests`: untouched files stay byte-identical and most points lie on the ground (main_world and
-  instance_prologue); a synthetic block with a bridge and a hole.
+* **Walls and slopes.** A link between two nodes on the ground is blocked as well when the edited ground between
+  them rises more than 1.5 m above the line between the nodes, or gets steeper than about 50° (rise over run 1.2),
+  where the original ground did not. Sampled every metre along the link. So NPCs no longer path across walls and
+  cliffs you sculpt; links over bridges (nodes off the ground) are left alone.
+* **Reopened links.** The other way round: a blocked link between two nodes on the ground opens when the ground
+  between them was a wall or too steep before the edit and can be walked now (a cliff smoothed into a ramp). Its
+  `max_pass_radius` becomes half the shared edge's length, as the bake writes it (from the paired `vertsmission`).
+  Links blocked on ground that was already walkable (obstacles, forbidden areas) stay blocked.
+* **New triangles** (`navmesh_add.rs`). The bake triangulates *all* the ground, sea and cliffs included (a block of
+  open sea is 6 triangles of 180 m); walkability is in the links, and the server's height is the plane of the
+  enclosing triangle. A hill raised or a valley cut inside a triangle is invisible to that plane, so such triangles
+  are split: when a point of a 4 m lattice inside a triangle (or every 4 m along one of its edges) has ground that
+  moved more than 1.5 m and lies more than 1.5 m off the triangle's plane, the triangle is replaced by a constrained
+  Delaunay triangulation (`spade`) of its corners and the lattice / edge points of the edited area plus a one-point
+  ring, at the new ground height. The first child keeps the triangle's record and id, the others get the next ids;
+  new corners are appended to the `vertsmission`. Children sharing an edge get a link each way (radius = half the
+  edge, or -1 when the ground between their centres has a hole, a wall over 1.5 m or a slope over 1.2), with the
+  bake's constant fields (exposure 1, `0, 0, 327.66`, bytes `1, 49`); the triangle's links to its neighbours move to
+  the child on that edge. Two split neighbours share their edge points, and their children are linked where the old
+  link was open. The bake repeats a triangle in every block file it reaches into (the server merges nodes by XY), so
+  the split depends only on the triangle's world corners (to the millimetre) and the ground, and the export also
+  runs over the ring of blocks around the edited cells: every copy splits the same way. Checked on a sculpted mound
+  in the sea east of the Nuia start: 6 triangles split into 234 over 5 blocks, 0 disagreements between the files
+  (the server's merge view), and test islands / hills / cliffs / shared edges (`navmesh_add` tests).
+* **Not updated:** `areasmission*.bai` (forbidden areas, designer paths) and the `hidemission` files (the server
+  doesn't load them).
+* Status line: "Navmesh: N file(s), P point(s) moved, K off the ground kept, L link(s) blocked (W by new walls or
+  slopes, the rest over holes), R reopened, S triangle(s) split into C". Tests `navmesh::tests`: untouched files stay
+  byte-identical and most points lie on the ground (main_world and instance_prologue); a synthetic block with a bridge
+  and a hole; a sculpted wall blocks a link, a raise of everything and an old wall do not; a smoothed wall reopens one.
+  `navmesh_add::tests`: a hill inside a triangle and one on a shared edge (heights within 1.5 m, every node reachable),
+  a cliff (links over it blocked), fitting triangles untouched, two copies of a triangle split alike, and an island
+  raised in a real sea block.
 
 ## Tools
 
@@ -123,8 +151,16 @@ navmesh triangles / nodes first, so the editor moves the navmesh with the ground
   is refused) and writes `leveldata.xml` to the overlay at once. The world's layer library already holds every
   material some cell uses, so no texture is added: the loaded cell's shader table gets the donor's entry for the new
   slot (uv offsets recomputed for this cell) and the material shows immediately; after a restart the library reads the
-  overlay's `leveldata.xml`. A material no cell of the world uses cannot be added. Checks: `--paint-material <name
-  part>` paints that material with `--paint x,y` and turns `--add-surface` on.
+  overlay's `leveldata.xml`. Checks: `--paint-material <name part>` paints that material with `--paint x,y` and
+  turns `--add-surface` on.
+  * **More materials** (second tick box): the materials of the other worlds' cells and every
+    `materials/aa_terrain/**.mtl` of the pak that no world uses (about 280 more than main_world's 317). Their elements
+    come from the other world's `leveldata.xml`, or are written with the common 0.2 detail scale. These textures are not
+    in this world's layer arrays, so the brush paints them into the heightmap at once; when the stroke ends the editor
+    rebuilds the layer library (it reads the overlay's `leveldata.xml` files, which now name them) and reloads the
+    terrain cells and their objects (`surface_add::reload_terrain`, a same-world version of `aa_world::switch`), which
+    get the unsaved edits back. Checked: a pak-only road material painted into cell (15, 14) draws in the same session
+    (325 materials after the reload instead of 324), with the edit still unsaved.
 * **Hole.** Sets samples to 31 (Shift or "fill holes" fills them again with the pak's surface, else a neighbour's).
   The sector's `hasHoles` gate follows (cut: on; fill: off when no hole is left), the patch meshes of the touched
   sectors are rebuilt (`build_patch_mesh` cuts the quads). `Heights::raycast` passes through holes,
@@ -210,12 +246,22 @@ the cell under the cursor:
   `vegetation.dat` record with the group set. The new object is then an ordinary world object (select, drag, turn,
   delete, Ctrl+S). There is no separate preview pane: the ghost in the world is the preview ("Model preview" shows
   database rows only).
-* **Decals, Roads, Water** (`object.dat` item types 9, 13, 11). The list shows the cell's objects with coloured
-  outlines; the selected one is white. Move (X / Y / Z buttons by a step) or delete. A move shifts the whole object:
-  box, position, road spline points, water outline points and the water plane. The octree the Objects tools save is
-  edited, so untouched bytes stay the same. The streamer builds these meshes once per cell, so the outline moves at
-  once and the drawn geometry after Ctrl+S and **Reload objects** (drops every loaded cell's objects and reads them
-  again from pak + overlay) or a restart.
+* **Decals, Roads, Water** (`object.dat` item types 9, 13, 11; `objects_extra/shape.rs`). The list shows the cell's
+  objects with coloured outlines; the selected one is white. Move (X / Y / Z buttons by a step), **Copy** (a new octree
+  item 10 m east, then drag it into place) or delete. The selected item has handles in the view:
+  * white: moves the whole object (box, position, road spline points, water outline points and plane). Decals and
+    roads follow the ground; water keeps its surface height (use the Z buttons for that);
+  * yellow (roads): a spline node, i.e. both edge points of it, so the road bends and keeps its width;
+  * small blue: one road edge point (the width there) or one water outline point. The water's physics outline point
+    moves with it when the two outlines have the same points.
+  The box is refitted to the points after each change. **Undo** in the window undoes these changes one by one.
+  The octree the Objects tools save is edited, so untouched bytes stay the same.
+  **Drawing.** Water is meshed again at once: the cell's edited `object.dat` goes through `aa-world`'s parser and
+  water mesher, the editor draws the result with the streamer's water materials and hides the streamer's water of
+  that cell until the next reload. Roads and decals are built by `aa-world` code that is private to it, so with
+  **Redraw roads and decals at once** (on by default) a change to one (a handle let go, a step, copy, delete or
+  undo) saves the objects to the overlay and reloads the loaded cells' objects once the save is written (a second
+  or two). Untick it to keep them unsaved: the outline shows the edit and **Save and redraw** draws it.
 * **Interior brushes** (`visareas.dat`). Each area / portal record holds its own small octree. Its brushes are matched
   to the drawn brushes by model and position; they move and delete like the others, and the drawn brush follows at
   once. `visareas.dat` is written next to the cell's other files on Ctrl+S (record lengths and the header's compiled
@@ -223,14 +269,18 @@ the cell under the cursor:
   25th main_world file, and `other_worlds_round_trip`).
 * Checks: `--place-model <game/objects/...cgf | veg:<group>> --place-at x,y[,z]` places one object 8 s after start;
   `--extra-move <decal|road|water|interior>[#n]:dx,dy,dz` moves the n-th object of that kind in the camera's cell (no
-  numbers: deletes it); add `--objects-save` to save.
-* Not editable: decal / road / water shapes (whole-object moves only), new decals / roads / water, voxels, and the
-  area / portal shapes of `visareas.dat` (only its brushes). The octree node boxes are not refitted after a move.
+  numbers: deletes it; with `--extra-grip <i>` only its point `i`); add `--objects-save` to save.
+* Not editable: decal size and projection, voxels, and the area / portal shapes of `visareas.dat` (only its brushes).
+* The check `--extra-move` also logs where the item is now, and redraws roads and decals like the window does.
+  Octree node boxes are not refitted (a copy goes to the root node, whose box covers the cell).
 
 ## Worlds checked
 
-The tools assume only the cell / block layout, so any world in `game/worlds/` loads (`--world <name>` with
-`--spawn-dir <copy of Data/Worlds/name>`). Checked:
+The tools assume only the cell / block layout, so any world in `game/worlds/` loads (the world menu, or `--world
+<name>` with `--spawn-dir <copy of Data/Worlds/name>`). Every world of the pak is checked by the test
+`every_world_round_trip`: each cell's `object.dat`, `visareas.dat`, `brush.dat` and `vegetation.dat` write back byte for
+byte, and an unedited `heightmap.dat` written by the editor reads back within one quantisation step (main_world too with
+`AA_EDITOR_ALL_WORLDS=1`). Each world was also opened in the editor (see the table below). Earlier hands-on checks:
 
 | World | What was run |
 |---|---|
@@ -238,6 +288,8 @@ The tools assume only the cell / block layout, so any world in `game/worlds/` lo
 | `instance_library` (interior dungeon) | loads and renders (25-30 fps, dev build); an interior bookshelf deleted, saved and still gone after a restart; a new model placed in a `brush.dat` cell, saved and reloaded |
 | `instance_prologue` (island, 4 cells) | loads (70-80 fps); sculpt, save and "Export terrain to server" with the navmesh (2 files patched, only Z bytes changed); navmesh offsets checked by a test |
 | `instance_sal_temple`, `arche_mall_world` (and the two above) | every `object.dat` and readable `visareas.dat` round-trips byte-identical (test `other_worlds_round_trip`) |
+| all 17 worlds | opened with a screenshot each: no panics, no errors, 25-120 fps (dev build) |
+| `arche_mall_world`, `instance_hadir_farm` | open as a white / beige wall: their zone `time_of_day.xml` pins the clock (13:00 / 8:30) with a volumetric fog of global density 5 (main_world zones: 0.4-1.5) and white or pale fog colours (`arche_mall_world` is the cash shop's showroom backdrop). That is the data, drawn as `aa-world` draws it; turn **View → Fog** off (or start with `--no-fog`) to edit them. arche_mall's town square runs at about 16 fps once its 196 NPCs are loaded (25 without them; the animation rate makes no difference, it is the characters' draw cost) and 4-9 fps for the 25 s they take to load |
 
 Only Windows was used.
 
@@ -268,6 +320,8 @@ turntable render of one row. Code: `crates/aa-editor/src/model_preview.rs`.
 * **NPCs:** the same model as the world (the dressed humanoid with its carried weapons, a creature with its idle
   animation, a static model or prefab), scaled by `npcs.scale`.
 * **Doodads:** the `.cgf` or the prefab's parts.
+* **World objects:** in Objects mode, the model of the selected brush, vegetation instance or entity prop
+  (`--preview-open` opens the window at start).
 * **Items:** the icon (`items.icon_id` -> `icons.filename` under `ui/icon/`) plus:
   * weapons: `item_weapons` -> `item_assets.path` (a `.cgf`, or a `.cdf` carrier with its parts), stood up on its
     longest axis;
@@ -282,6 +336,126 @@ turntable render of one row. Code: `crates/aa-editor/src/model_preview.rs`.
   shown in the window, with its own ambient light) and its two directional lights see that layer, so nothing shows in
   the world view and the world's sun, fog and post effects stay off it. The camera is active only while the window is
   open, and a model is loaded only then.
+
+## Worlds and navigation
+
+* **World menu** (🌐 in the menu bar): the worlds of the pak (`worlds/<name>/world.g`). Picking one restarts the
+  editor on it, because every tool keeps per-world state. With unsaved changes it asks first: save all and switch,
+  discard and switch, or cancel. The new editor keeps `--db`, `--read-only-db`, `--overlay`, `--mode` and the Play on
+  server flags. `--spawn-dir` and `--mirror` become `<parent>/<new world>`, so a server `Data/Worlds/<world>` layout
+  maps directly. If that spawn folder doesn't exist yet (a scratch copy), it starts as a copy of the lane's files.
+  The camera starts at the server's start point (`Worlds/world_spawns.json`), else in the middle of the world.
+* **Gizmo** (top-right corner of the 3D view; `nav.rs`):
+  * drag the ball to orbit around the point in the middle of the view (where the view's centre meets the ground);
+  * click X / Y / Z to look along that axis (X east, Y north; Z is the top view);
+  * drag 🔍 up / down to zoom and ✋ to pan;
+  * 🗺 opens the teleport window.
+* **Teleport** (M or 🗺; `teleport.rs`):
+  * **Map:** a shaded relief of the terrain heights, one pixel per 32 m, built in the background the first time it
+    opens (about 2 s for main_world). Drag to pan, use the wheel to zoom, click to teleport. Clicking a dot teleports
+    to that place. The red triangle is the camera.
+  * **Places:**
+    * zones, at the sector nearest the middle of each zone group's sectors (`world.xml`), named after the zone group
+      in the game database;
+    * the server's respawn, recall and world gate points (`Data/Portal/*.json`) that lie on this world's ground;
+    * the start point;
+    * bookmarks (★ Bookmark camera; kept per world in `data/local/editor/bookmarks.json`);
+    * with a search of two or more letters, NPC and doodad spawns by name or id (clicking one selects and focuses it).
+  * **Go to:** `x, y` (the ground there) or `x, y, z`, as the status bar shows them.
+
+## AI paths
+
+Paths mode (5, `paths.rs`) shows and edits the routes NPCs walk: the AAEmu server's `Data/Path/<name>.path` files, one
+point per line `action|x|y|z|param` (cry coordinates; `action` empty or `DisableLoop`, `EnableLoop`, `Speed`,
+`ActorFlags`, with `param` its value), as `aaemu-game/src/systems/ai/path_handler.rs` reads them. An NPC follows a
+route when its spawn entry says `"FollowPath": "<name>"`, or when a FollowPath AI command (`ai_commands.cmd_id = 2`,
+`param2` = the name) of a command set runs it (quests, skills). A name used in several zones can ship as
+`<name>@<zone>.path` variants: the server, and the editor's drawing, take the one passing closest to the NPC.
+
+* **In the view.** The routes within 600 m of the camera (the distance is in the panel): green start point, red end,
+  arrows along the way, a magenta stem on points with an action, magenta lines from the NPCs that follow the route to
+  its start. The selected route is yellow with numbered points. In every mode, the route of the selected NPC is drawn.
+* **Editing.** Click a point to select it and drag it (over the ground, keeping its height above it; untick "drag on
+  the ground" to keep Z). Shift+click the ground adds a point after the selected one, or at the end. Delete removes the
+  selected point, F focuses it, Esc drops the point selection, Ctrl+Z / Ctrl+Y undo / redo route edits.
+* **Panel** ("AI paths"):
+  * the routes, nearest first (search by name, or untick "near the camera" for all), with their point count, how many
+    spawns and AI commands use them and the distance;
+  * **New route** (empty: Shift+click to add points), **Duplicate**, **Delete route** (the file goes on save);
+  * the selected route: rename (spawns that name it follow the new name; with "renaming also updates the N AI
+    command(s)" ticked, the default, so do the database's commands), Focus, ▶ Walk (a marker walks it at 3 m/s),
+    Reverse, Close loop (the first point again at the end), Snap to ground;
+  * **Used by**: the spawns (click to select one) and "Selected NPC follows <route>"; and the `ai_commands` follow-route
+    rows (`cmd_id` 2, `param2` = the route) naming it, each with its set id, set name and row id: re-point a row to
+    another route, remove it (✖), or add a follow command to any command set by its id ("Add follow command", only
+    for ids in `ai_command_sets`; new rows get `param1` 1, the common value, and the next id). These count as unsaved
+    and are written to the game database with the routes (one transaction, only `cmd_id` 2 rows); with
+    `--read-only-db` they are reported and not written;
+  * the points: action, param, X / Y / Z, insert after, move up / down, remove.
+* **NPC inspector** (Select mode): an NPC's "AI path" with a link to its route, ✖ to stop it following one, "Follow
+  <selected route>", and "New route from here" (a new route `editor_<npc>_NN` starting at the NPC, which then follows
+  it).
+* **Saving** (Ctrl+S, File → Save AI paths, or the panel): every changed route is written to the path folder, CRLF, the
+  untouched coordinates as they were written; a renamed or deleted route's old file is removed. The first overwrite or
+  removal of a file keeps `<name>.path.editor-orig`. Saved files are copied to the `Path` folder of each spawn mirror
+  (`<mirror>/../../Path`). `FollowPath` changes are saved with the spawns. **Restart the server** to load them.
+* **Where routes are read from.** `--path-dir <dir>`; else `Data/Path` beside the spawn folder's `Data/Worlds` (the
+  server layout: the lane's source tree by default); else a `Path` folder beside the spawn folder (a scratch copy,
+  filled from the lane's routes the first time).
+* Checks: `--mode paths`, `--path <name>` (select and focus that route), `--paths`.
+* Tests: route files round-trip (the lane's 334 routes write back byte for byte), create / save / rename / delete with
+  backups, `@zone` variants resolve to the nearest, and spawns read, set and clear `FollowPath`.
+
+## Housing zones
+
+Housing mode (key `6`, `--mode housing`) edits where players may build and what. Module `housing.rs`.
+
+* **The data.** A housing zone is an `AreaShape` entity of a world zone's `level_design/zone/<key>/client/housing_area.xml`
+  (113 files in the pak, 384 zones, 380 of them in main_world): a name, `Pos`, `cellX` / `cellY` and the corners
+  relative to `Pos`. The server (`aaemu-game/src/systems/npcs/subzone.rs`) puts a corner at `(zone origin + cell) ×
+  1024 + Pos + point`, the origin being `originX` / `originY` of the zone's `<Zone>` in `world.xml`, takes the area id
+  from `value1` and tests a building's position against the polygon in 2D. The area id is a `housing_areas` row, which
+  names a **rule set** (`housing_groups`) and its **allowed building categories** (`housing_group_categories`, the
+  `housings.category_id` of the designs). `placement.rs` lets a building stand when a rule set of an area under it
+  allows the category and the player passes its conditions: `houseless` (only players who own no building),
+  `existing_category_id` (not players who already own a building of that category). `can_extend` off makes the
+  building expire instead of paying more tax (the beginner plots). `doodad_id`, `allowed_tax_delay_week` and
+  `max_construct_count` are client data the server does not use; they are editable all the same.
+* **In the view**: the zones within a radius of the camera (800 m by default) are drawn along the ground, coloured by
+  rule set, with posts at the corners and a label (name, area id, rule set). Click a zone to select it (yellow, with
+  numbered corners); drag a corner to move it, drag inside to move the whole zone; Shift+click an edge (or anywhere,
+  for the selected zone's nearest edge) adds a corner; Delete removes the selected corner (a zone keeps 3). F frames
+  the zone (or focuses the corner). Ctrl+Z / Ctrl+Y undo and redo zone and rule edits together.
+* **Draw new zone**: click the corners on the ground, Enter (or Finish) closes it, Esc cancels, Backspace removes the
+  last corner. It goes into the file of the world zone owning the 64 m sector under the first corner (the file is
+  created if that zone had none), named `LevelDesignShape_<zone>_editor_<n>`, with the next `EntityId` and a new
+  `EntityGuid`, and gets a new `housing_areas` row (the next free id over the database and all worlds' files, the
+  zone group's name, the shape name as comment) with the rule set picked beside the button.
+* **Window "Housing zones", Zones tab**: search (name or area id) and the list near the camera; the selected zone's
+  name (renaming also renames its area row's comment), area id (point it at another row; zones sharing a row are
+  counted), rule set of its area row (a shared row changes for every zone using it), what that rule set allows,
+  Focus, Duplicate (a copy 20 m east with its own area row), Delete zone (its area row goes too when no zone in any
+  world uses it any more), and the corners (X / Y, remove). A zone whose area id has no row gets "Create the row".
+* **Rule sets tab**: the 15 rule sets with how many areas use them; the selected one's English name and description
+  (`localized_texts`), the conditions above, and the allowed categories (named after their designs, e.g. "11
+  Swept-Roof Manse, Villa (56 designs)") with add / remove. "New rule set" copies the selected one with the next id;
+  "Delete rule set" only for one no area uses.
+* **Saving** (Ctrl+S, File → Save housing zones, or the window): each changed zone file is written to the pak overlay
+  (`<overlay>/worlds/<world>/level_design/zone/<key>/client/housing_area.xml`, what the client reads) and to the
+  server's `<server-data>/ClientOverlay/game/worlds/...` (first overwrite keeps `housing_area.xml.editor-orig`), and
+  that folder is listed first in `ClientData.Sources` of the server config, as for "Server terrain" (`--server-data`,
+  `--server-config`). The rule changes go to the database in one transaction (booleans as `'t'` / `'f'` like the
+  rest, new rows with the next id); `--read-only-db` refuses them and says so. **Restart the server** to load both.
+* **Files written as they were.** An untouched zone is written back as its original lines; a changed one in the same
+  layout, every number that did not change in its original text (new ones as `%.8g`, like the original editor), the
+  file's own line ending (6 files use CRLF) and the `Rotate` of the 4 zones that have one (a 1° tilt the server
+  ignores). Test: all 113 files of the pak, regenerated from their parsed zones, are byte-identical. A moved zone's
+  world position is kept in `f32` (as the server tests it), so its `Pos` can shift by a tenth of a millimetre.
+* Checks: `--housing <area id>` starts in Housing mode with that zone selected and framed; `--housing-nudge dx,dy`
+  then moves it and saves (with scratch `--overlay`, `--server-data` and `--server-config`); `--housing-tab rules`.
+  Checked: area 212 ("terrorhousing1", Luxury Housing Province) follows its island's grass edge; nudged 30 m east and
+  saved, the files in the overlay and the scratch `ClientOverlay` differ from the pak's only in that zone's `Pos`, and
+  the scratch config lists the overlay. 42-88 fps (dev build).
 
 ## Coordinates
 
@@ -317,16 +491,20 @@ aa-client has no start-position flag that reaches the server (`--pos x,y[,z]` mo
 
 ## Gaps
 
-* Decals, roads and water can only be moved or deleted as a whole: no reshaping, no new ones. Moved ones draw in
-  their new place after "Reload objects" or a restart. The octree node boxes of `object.dat` are not refitted after a
-  move. Area and portal shapes of `visareas.dat` are not editable.
-* A new surface type must be a material some cell of the same world already uses (no new textures). Surface painting
-  changes the detail layer only; the cover colour needs the Tint brush.
-* The navmesh follows height edits only: no new triangles or links, and sculpted walls do not block paths (see
-  "Server terrain").
-* Worlds checked: main_world, instance_library, instance_prologue, plus a round-trip test over two more. The others
-  are untested. Windows only.
+* Roads and decals redraw by saving the objects (on by default) or with "Save and redraw"; there is no unsaved live
+  preview of their drawn shape. Decal size / projection and the area / portal shapes of `visareas.dat` are not
+  editable. The octree node boxes of `object.dat` are not refitted.
+* A surface type from another world or the pak reloads the terrain when the stroke ends (a few seconds). Brand-new
+  textures (files not in the pak) cannot be added. Surface painting changes the detail layer only; the cover colour
+  needs the Tint brush.
+* The navmesh follows height edits (heights, blocked and reopened links, split triangles) but `areasmission` (forbidden
+  areas) is not touched, and nothing was run against the server's A* yet: the files were checked with the server's
+  reader rules (links within a file, nodes merged by XY) by tests and a script, not by NPCs walking.
+* AI paths: the server reads routes and AI commands at start.
+* Housing zones: the server reads the zone files and rules at start. The editor lists the zones of the world it runs
+  on; area rows used by other worlds' zones are never deleted with a zone here. What the client does with a rule
+  set's `doodad_id`, tax delay and construct counts was not checked in the client.
+* Windows only.
 * Play (F5) runs inside the editor, without the server: no NPC AI, no quests. "Play on server" (below) runs the real client against the lane server for that.
-* Model preview: armour is shown alone on a bare body, without the rest of a set. Static world objects (brushes,
-  vegetation) are not previewed; select their spawn or row instead. Rigid bone attachments of creatures are missing,
-  as they are in the world.
+* Model preview: armour is shown alone on a bare body, without the rest of a set. Rigid bone attachments of creatures
+  are missing, as they are in the world.

@@ -219,12 +219,12 @@ pub fn load(conn: &Connection, npc_id: u32) -> Option<NpcLook> {
         }
     }
     // body parts: the last row per slot type
-    if let Ok(mut q) = conn.prepare("SELECT slot_type_id, item_id FROM item_body_parts WHERE model_id = ?1 ORDER BY id") {
-        if let Ok(rows) = q.query_map(params![model_id], |r| Ok((opt_u32(r.get(0)?), opt_u32(r.get(1)?)))) {
-            for (slot_type, item) in rows.flatten() {
-                if (23..=29).contains(&slot_type) && slot_type != 24 {
-                    slots[19 + (slot_type - 23) as usize] = item;
-                }
+    if let Ok(mut q) = conn.prepare("SELECT slot_type_id, item_id FROM item_body_parts WHERE model_id = ?1 ORDER BY id")
+        && let Ok(rows) = q.query_map(params![model_id], |r| Ok((opt_u32(r.get(0)?), opt_u32(r.get(1)?))))
+    {
+        for (slot_type, item) in rows.flatten() {
+            if (23..=29).contains(&slot_type) && slot_type != 24 {
+                slots[19 + (slot_type - 23) as usize] = item;
             }
         }
     }

@@ -252,7 +252,7 @@ fn ray_box(origin: Vec3, dir: Vec3, t: &GlobalTransform, aabb: &Aabb) -> Option<
     (t1 >= t0 && t0 > 0.0).then_some(t0)
 }
 
-fn pick(
+pub(crate) fn pick(
     editor: Res<Editor>,
     cursor: Res<Cursor>,
     mut objs: ResMut<WorldObjects>,

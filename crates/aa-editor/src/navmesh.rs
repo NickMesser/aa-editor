@@ -9,9 +9,16 @@
 //! roofs and other objects (further than the tolerance from the ground) stay. Links touching a node that is now over
 //! a hole are blocked (`max_pass_radius = -1`, the format's "boundary edge"), so A* no longer walks across the hole.
 //!
-//! Not updated: the triangulation itself. New ground (a raised plateau that used to be a cliff, a valley floor cut
-//! below an object) gets no new triangles or links, so it stays as walkable or unwalkable as before; slopes made too
-//! steep still have their old links. Only the heights of the existing mesh follow the terrain.
+//! Walls: a link between two nodes on the ground is blocked as well when the edit raised the ground between them into a
+//! wall ([`WALL`] above the line between the nodes, where it was not before) or made it steeper than [`MAX_SLOPE`]
+//! (where it was not), so NPCs no longer path across sculpted walls and cliffs. The other way round, a blocked link
+//! between two nodes on the ground is **reopened** when the ground between them was a wall or too steep before the
+//! edit and can be walked now (a cliff smoothed into a ramp): its `max_pass_radius` becomes half the shared edge's
+//! length, as the bake writes it. Links blocked on walkable ground (obstacles, forbidden areas) stay blocked.
+//!
+//! The bake triangulates all the ground (walkability is in the links), so a sculpted hill or valley is inside some
+//! triangle whose plane no longer follows it: [`crate::navmesh_add::refine`] splits those triangles (after the
+//! adjustment above) so the server's heights and links follow the new shape.
 //!
 //! Layout (little endian; `bai.rs`): netmission = `i32 version (55 / 54)`, bbox min / max (6 f32), `i32 nodes`,
 //! nodes of 60 bytes (`id`, `dir`, `up`, `pos` at +28, ...), `i32 links`, links of 44 bytes (`src`, `dst`,
@@ -32,6 +39,10 @@ pub const TOLERANCE: f32 = 1.5;
 pub const MIN_SHIFT: f32 = 0.05;
 /// Size of a path block.
 pub const BLOCK: f32 = 256.0;
+/// Metres the edited ground may rise above the line between two linked nodes before the link counts as walled off.
+pub const WALL: f32 = 1.5;
+/// Steepest walkable ground (rise over run, about 50°) along a link after an edit.
+pub const MAX_SLOPE: f32 = 1.2;
 const CELL: f32 = 1024.0;
 
 /// Ground before and after the edit at a world XY: `(old, new, new_is_hole)`, `None` outside edited cells.
@@ -42,7 +53,12 @@ pub type Ground<'a> = dyn Fn(f32, f32) -> Option<(f32, f32, bool)> + 'a;
 pub struct Changed {
     pub moved: usize,
     pub kept: usize,
+    /// Links blocked (holes and walls).
     pub blocked_links: usize,
+    /// Of those, links blocked by a new wall or slope.
+    pub walls: usize,
+    /// Blocked links reopened because the edit made the ground between them walkable.
+    pub opened: usize,
 }
 
 fn f32_at(b: &[u8], o: usize) -> Result<f32> {
@@ -72,8 +88,10 @@ fn adjust_point(b: &mut [u8], o: usize, origin: (f32, f32), ground: &Ground, ch:
     Ok((true, hole))
 }
 
-/// Netmission of block `(bx, by)`: nodes, link edge centres and the bbox Z follow the ground. Patches `b` in place.
-pub fn adjust_net(b: &mut [u8], block: (u32, u32), ground: &Ground) -> Result<Changed> {
+/// Netmission of block `(bx, by)`: nodes, link edge centres and the bbox Z follow the ground, links over new holes and
+/// walls are blocked and links over ground the edit made walkable reopened (their radius from the triangle corners in
+/// `verts`, the paired vertsmission, else 1 m). Patches `b` in place.
+pub fn adjust_net(b: &mut [u8], block: (u32, u32), ground: &Ground, verts: Option<&[u8]>) -> Result<Changed> {
     let version = i32_at(b, 0)?;
     if version != 55 && version != 54 {
         bail!("netmission version {version}");
@@ -83,11 +101,21 @@ pub fn adjust_net(b: &mut [u8], block: (u32, u32), ground: &Ground) -> Result<Ch
     let nodes = i32_at(b, 28)?.max(0) as usize;
     let mut zs: Vec<f32> = Vec::new();
     let mut hole_ids = std::collections::HashSet::new();
+    let mut corners_of: HashMap<u32, [i32; 3]> = HashMap::new();
+    // node id -> (world x, y, z before, z after) of the nodes that sat on the original ground
+    let mut on_ground: HashMap<u32, (f32, f32, f32, f32)> = HashMap::new();
     for i in 0..nodes {
         let o = 32 + i * 60;
+        let before = f32_at(b, o + 36)?;
         let (_, hole) = adjust_point(b, o + 28, origin, ground, &mut ch)?;
+        let id = i32_at(b, o)? as u32;
+        corners_of.insert(id, [i32_at(b, o + 44)?, i32_at(b, o + 48)?, i32_at(b, o + 52)?]);
         if hole {
-            hole_ids.insert(i32_at(b, o)? as u32);
+            hole_ids.insert(id);
+        }
+        let (x, y) = (f32_at(b, o + 28)? + origin.0, f32_at(b, o + 32)? + origin.1);
+        if ground(x, y).is_some_and(|(old, _, _)| (before - old).abs() <= TOLERANCE) {
+            on_ground.insert(id, (x, y, before, f32_at(b, o + 36)?));
         }
         zs.push(f32_at(b, o + 36)?);
     }
@@ -98,9 +126,31 @@ pub fn adjust_net(b: &mut [u8], block: (u32, u32), ground: &Ground) -> Result<Ch
         // `edge_center` is read with the offset added (z offset is 0, so the same local -> world rule holds)
         adjust_point(b, o + 8, origin, ground, &mut ch)?;
         let (src, dst) = (i32_at(b, o)? as u32, i32_at(b, o + 4)? as u32);
-        if (hole_ids.contains(&src) || hole_ids.contains(&dst)) && f32_at(b, o + 20)? != -1.0 {
+        if f32_at(b, o + 20)? == -1.0 {
+            if let (Some(a), Some(c)) = (on_ground.get(&src), on_ground.get(&dst))
+                && !hole_ids.contains(&src)
+                && !hole_ids.contains(&dst)
+                && rough(*a, *c, ground, false)
+                && !rough(*a, *c, ground, true)
+            {
+                let edge = (b[o + 40] as usize % 3, b[o + 41] as usize % 3);
+                let radius = verts
+                    .zip(corners_of.get(&src))
+                    .and_then(|(v, c)| Some((vert_xy(v, c[edge.0])?, vert_xy(v, c[edge.1])?)))
+                    .map_or(1.0, |(p, q)| (((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt() / 2.0 * 100.0).round() / 100.0);
+                put_f32(b, o + 20, radius);
+                ch.opened += 1;
+            }
+            continue;
+        }
+        let walled = match (on_ground.get(&src), on_ground.get(&dst)) {
+            (Some(a), Some(c)) => walled(*a, *c, ground),
+            _ => false,
+        };
+        if hole_ids.contains(&src) || hole_ids.contains(&dst) || walled {
             put_f32(b, o + 20, -1.0);
             ch.blocked_links += 1;
+            ch.walls += walled as usize;
         }
     }
     if lo + 4 + links * 44 > b.len() {
@@ -112,6 +162,68 @@ pub fn adjust_net(b: &mut [u8], block: (u32, u32), ground: &Ground) -> Result<Ch
         put_f32(b, 24, f32_at(b, 24)?.max(max));
     }
     Ok(ch)
+}
+
+/// XY of record `k` of a vertsmission.
+fn vert_xy(v: &[u8], k: i32) -> Option<(f32, f32)> {
+    let o = 8 + usize::try_from(k).ok()? * 32;
+    (o + 8 <= v.len()).then(|| (f32_at(v, o).unwrap_or(0.0), f32_at(v, o + 4).unwrap_or(0.0)))
+}
+
+/// Whether the ground (before the edit, or after with `new`) between two nodes on it (`(x, y, z before, z after)`)
+/// rises more than [`WALL`] above the line between them, is steeper than [`MAX_SLOPE`] or (after) has a hole. Ground
+/// outside the edited cells counts as rough (nothing to judge by).
+fn rough(a: (f32, f32, f32, f32), c: (f32, f32, f32, f32), ground: &Ground, new: bool) -> bool {
+    let run = ((c.0 - a.0).powi(2) + (c.1 - a.1).powi(2)).sqrt();
+    let n = (run.ceil() as usize).clamp(2, 512);
+    let step = run / n as f32;
+    let mut prev: Option<f32> = None;
+    for k in 0..=n {
+        let t = k as f32 / n as f32;
+        let Some((old, now, hole)) = ground(a.0 + (c.0 - a.0) * t, a.1 + (c.1 - a.1) * t) else { return true };
+        let (z, line) = if new { (now, a.3 + (c.3 - a.3) * t) } else { (old, a.2 + (c.2 - a.2) * t) };
+        if (new && hole) || z - line > WALL {
+            return true;
+        }
+        if let Some(p) = prev
+            && step > 0.0
+            && (z - p).abs() / step > MAX_SLOPE
+        {
+            return true;
+        }
+        prev = Some(z);
+    }
+    false
+}
+
+/// Whether the edit put a wall or a too steep slope between two linked nodes on the ground (`(x, y, z before, z after)`).
+fn walled(a: (f32, f32, f32, f32), c: (f32, f32, f32, f32), ground: &Ground) -> bool {
+    let run = ((c.0 - a.0).powi(2) + (c.1 - a.1).powi(2)).sqrt();
+    let n = (run.ceil() as usize).clamp(2, 512);
+    let step = run / n as f32;
+    let mut prev: Option<(f32, f32)> = None;
+    for k in 0..=n {
+        let t = k as f32 / n as f32;
+        let (x, y) = (a.0 + (c.0 - a.0) * t, a.1 + (c.1 - a.1) * t);
+        let Some((old, new, _)) = ground(x, y) else {
+            prev = None;
+            continue;
+        };
+        let line_old = a.2 + (c.2 - a.2) * t;
+        let line_new = a.3 + (c.3 - a.3) * t;
+        if new - line_new > WALL && old - line_old <= WALL {
+            return true;
+        }
+        if let Some((p_old, p_new)) = prev
+            && step > 0.0
+            && (new - p_new).abs() / step > MAX_SLOPE
+            && (old - p_old).abs() / step <= MAX_SLOPE
+        {
+            return true;
+        }
+        prev = Some((old, new));
+    }
+    false
 }
 
 /// Vertsmission of block `(bx, by)`: the triangle corners follow the ground.
@@ -159,10 +271,16 @@ pub struct Report {
     pub moved: usize,
     pub kept: usize,
     pub blocked_links: usize,
+    pub walls: usize,
+    pub opened: usize,
+    /// Triangles split ([`crate::navmesh_add::refine`]) and the triangles they became.
+    pub split: usize,
+    pub children: usize,
 }
 
-/// Rewrites the navmesh files of every block of the edited cells and writes them under each of `dests` (a client
-/// tree root: `<dest>/game/worlds/...`, or with `strip_game` the pak overlay layout `<dest>/worlds/...`).
+/// Rewrites the navmesh files of every block of the edited cells (and the ring of blocks around them, which repeat the
+/// border triangles) and writes them under `server_dir` (`<dir>/game/worlds/...`) and the pak overlay
+/// (`<overlay>/worlds/...`).
 pub fn export(world: &str, edited: &HashMap<(i32, i32), Arc<CellHeights>>, server_dir: &Path, pak_overlay: Option<&Path>) -> Result<Report> {
     let mut originals: HashMap<(i32, i32), Option<CellHeights>> = HashMap::new();
     for &c in edited.keys() {
@@ -178,34 +296,70 @@ pub fn export(world: &str, edited: &HashMap<(i32, i32), Arc<CellHeights>>, serve
     };
     let pak = aa_pak::Pak::global();
     let mut report = Report::default();
-    let mut cells: Vec<_> = edited.keys().copied().collect();
-    cells.sort();
-    for c in cells {
-        for b in cell_blocks(c) {
-            let dir = block_dir(world, b);
-            let names: Vec<String> = pak.list(&format!("{dir}/")).map(str::to_string).collect();
-            for name in names {
-                let file = name.rsplit('/').next().unwrap_or("").to_string();
-                let net = file.starts_with("netmission") && file.ends_with(".bai");
-                let verts = file.starts_with("vertsmission") && file.ends_with(".bai");
-                if !net && !verts {
+    let mut blocks: Vec<(u32, u32)> = edited
+        .keys()
+        .flat_map(|&c| cell_blocks(c))
+        .flat_map(|b| (-1i64..=1).flat_map(move |dx| (-1i64..=1).map(move |dy| (b.0 as i64 + dx, b.1 as i64 + dy))))
+        .filter(|&(x, y)| x >= 0 && y >= 0)
+        .map(|(x, y)| (x as u32, y as u32))
+        .collect();
+    blocks.sort();
+    blocks.dedup();
+    for b in blocks {
+        let dir = block_dir(world, b);
+        let names: Vec<String> = pak.list(&format!("{dir}/")).map(str::to_string).collect();
+        // netmissionN.bai with its vertsmissionN.bai
+        let missions: Vec<String> = names
+            .iter()
+            .filter_map(|n| n.rsplit('/').next()?.strip_prefix("netmission")?.strip_suffix(".bai").map(str::to_string))
+            .collect();
+        for m in missions {
+            let (net_name, verts_name) = (format!("{dir}/netmission{m}.bai"), format!("{dir}/vertsmission{m}.bai"));
+            let mut net = original(&net_name).with_context(|| format!("read {net_name}"))?;
+            let mut verts = original(&verts_name).ok();
+            let mut ch = match adjust_net(&mut net, b, &ground, verts.as_deref()) {
+                Ok(ch) => ch,
+                Err(e) => {
+                    bevy::log::warn!("navmesh: {net_name}: {e:#}");
                     continue;
                 }
-                let mut bytes = original(&name).with_context(|| format!("read {name}"))?;
-                let ch = if net { adjust_net(&mut bytes, b, &ground) } else { adjust_verts(&mut bytes, b, &ground) };
-                let ch = match ch {
-                    Ok(ch) => ch,
-                    Err(e) => {
-                        bevy::log::warn!("navmesh: {name}: {e:#}");
-                        continue;
+            };
+            let mut verts_changed = false;
+            if let Some(v) = verts.as_mut() {
+                match adjust_verts(v, b, &ground) {
+                    Ok(c) => {
+                        verts_changed = c.moved > 0;
+                        ch.moved += c.moved;
+                        ch.kept += c.kept;
                     }
-                };
-                report.kept += ch.kept;
-                if ch.moved == 0 && ch.blocked_links == 0 {
-                    continue;
+                    Err(e) => bevy::log::warn!("navmesh: {verts_name}: {e:#}"),
                 }
-                report.moved += ch.moved;
-                report.blocked_links += ch.blocked_links;
+            }
+            let mut refined = crate::navmesh_add::Refined::default();
+            if let Some(v) = verts.as_mut() {
+                match crate::navmesh_add::refine(&mut net, v, b, &ground) {
+                    Ok(r) => refined = r,
+                    Err(e) => bevy::log::warn!("navmesh: {net_name}: cannot split triangles: {e:#}"),
+                }
+            }
+            report.kept += ch.kept;
+            report.moved += ch.moved;
+            report.blocked_links += ch.blocked_links;
+            report.walls += ch.walls;
+            report.opened += ch.opened;
+            report.split += refined.split;
+            report.children += refined.children;
+            let net_changed = ch.moved > 0 || ch.blocked_links > 0 || ch.opened > 0 || refined.split > 0;
+            let mut files: Vec<(&str, &[u8])> = Vec::new();
+            if net_changed {
+                files.push((&net_name, &net));
+            }
+            if let Some(v) = verts.as_deref()
+                && (verts_changed || refined.split > 0)
+            {
+                files.push((&verts_name, v));
+            }
+            for (name, bytes) in files {
                 let lower = name.to_ascii_lowercase();
                 let mut dests = vec![server_dir.join(&lower)];
                 if let Some(o) = pak_overlay {
@@ -214,7 +368,7 @@ pub fn export(world: &str, edited: &HashMap<(i32, i32), Arc<CellHeights>>, serve
                 for path in dests {
                     std::fs::create_dir_all(path.parent().context("no parent")?)?;
                     crate::server_terrain::backup(&path)?;
-                    std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
+                    std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
                 }
                 report.files += 1;
             }
@@ -258,7 +412,7 @@ mod tests {
                 let mut copy = orig.clone();
                 let none = |_: f32, _: f32| None;
                 if kind.starts_with("net") {
-                    adjust_net(&mut copy, b, &none).unwrap();
+                    adjust_net(&mut copy, b, &none, None).unwrap();
                 } else {
                     adjust_verts(&mut copy, b, &none).unwrap();
                 }
@@ -270,7 +424,7 @@ mod tests {
                     let h = heights.mesh_height(lx, ly);
                     Some((h, h + 1.0, false))
                 };
-                let ch = if kind.starts_with("net") { adjust_net(&mut probe, b, &g).unwrap() } else { adjust_verts(&mut probe, b, &g).unwrap() };
+                let ch = if kind.starts_with("net") { adjust_net(&mut probe, b, &g, None).unwrap() } else { adjust_verts(&mut probe, b, &g).unwrap() };
                 on += ch.moved;
                 total += ch.moved + ch.kept;
             }
@@ -307,7 +461,7 @@ mod tests {
         b.extend([0u8, 1, 1, 0]);
         // block (2, 3): world x = 512 + local; hole for x > 600
         let g = |x: f32, _y: f32| Some((10.0, 13.0, x > 600.0));
-        let ch = adjust_net(&mut b, (2, 3), &g).unwrap();
+        let ch = adjust_net(&mut b, (2, 3), &g, None).unwrap();
         assert_eq!(ch.moved, 3, "two nodes and the edge centre");
         assert_eq!(ch.kept, 1);
         assert_eq!(ch.blocked_links, 1);
@@ -319,5 +473,106 @@ mod tests {
         assert_eq!(f32_at(&b, lo + 20).unwrap(), -1.0);
         assert!((f32_at(&b, lo + 16).unwrap() - 13.0).abs() < 1e-4);
         assert!((f32_at(&b, 24).unwrap() - 20.0).abs() < 1e-4, "bbox max stays");
+    }
+
+    /// Two nodes 40 m apart on flat ground, linked: a wall sculpted between them blocks the link, a gentle raise of
+    /// everything does not, nor does a wall that was already there.
+    #[test]
+    fn sculpted_walls_block_links() {
+        let block = || {
+            let mut b = Vec::new();
+            b.extend(55i32.to_le_bytes());
+            for v in [0f32, 0., 0., 256., 256., 20.] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend(2i32.to_le_bytes());
+            for (id, x) in [(1u32, 10f32), (2, 50.)] {
+                b.extend(id.to_le_bytes());
+                for v in [1f32, 0., 0., 0., 0., 1., x, 30., 10.] {
+                    b.extend(v.to_le_bytes());
+                }
+                for v in [0i32, 0, 1, 2] {
+                    b.extend(v.to_le_bytes());
+                }
+                b.extend([2u8, 0, 0, 0]);
+            }
+            b.extend(1i32.to_le_bytes());
+            b.extend(1u32.to_le_bytes());
+            b.extend(2u32.to_le_bytes());
+            for v in [30f32, 30., 10., 2.0, 0., 0., 0., 0.] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0u8, 1, 1, 0]);
+            b
+        };
+        let radius = |b: &[u8]| f32_at(b, 32 + 2 * 60 + 4 + 20).unwrap();
+        // a 6 m wall across x = 28..32 (block (0, 0): world = local)
+        let mut b = block();
+        let wall = |x: f32, _y: f32| Some((10.0, if (28.0..32.0).contains(&x) { 16.0 } else { 10.0 }, false));
+        let ch = adjust_net(&mut b, (0, 0), &wall, None).unwrap();
+        assert_eq!((ch.blocked_links, ch.walls), (1, 1));
+        assert_eq!(radius(&b), -1.0);
+        // everything 2 m higher: the nodes follow, the link stays open
+        let mut b = block();
+        let raise = |_x: f32, _y: f32| Some((10.0, 12.0, false));
+        let ch = adjust_net(&mut b, (0, 0), &raise, None).unwrap();
+        assert_eq!(ch.blocked_links, 0);
+        assert_eq!(radius(&b), 2.0);
+        // the wall was there before: not ours to block
+        let mut b = block();
+        let old_wall = |x: f32, _y: f32| {
+            let h = if (28.0..32.0).contains(&x) { 16.0 } else { 10.0 };
+            Some((h, h + 0.5, false))
+        };
+        assert_eq!(adjust_net(&mut b, (0, 0), &old_wall, None).unwrap().blocked_links, 0);
+    }
+
+    /// The same two nodes with their link blocked: smoothing a wall that stood between them reopens it, a block on
+    /// flat ground (an obstacle) stays.
+    #[test]
+    fn smoothed_walls_reopen_links() {
+        let block = |radius: f32| {
+            let mut b = Vec::new();
+            b.extend(55i32.to_le_bytes());
+            for v in [0f32, 0., 0., 256., 256., 20.] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend(2i32.to_le_bytes());
+            for (id, x) in [(1u32, 10f32), (2, 50.)] {
+                b.extend(id.to_le_bytes());
+                for v in [0f32, 0., 0., 0., 0., 0., x, 30., 10.] {
+                    b.extend(v.to_le_bytes());
+                }
+                for v in [0i32, 0, 1, 2] {
+                    b.extend(v.to_le_bytes());
+                }
+                b.extend([2u8, 0, 0, 0]);
+            }
+            b.extend(1i32.to_le_bytes());
+            b.extend(1u32.to_le_bytes());
+            b.extend(2u32.to_le_bytes());
+            for v in [30f32, 30., 10., radius, 1., 0., 0., 327.66] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend([0u8, 1, 1, 49]);
+            b
+        };
+        // corners 0 and 1 of node 1's triangle: (28, 20) and (28, 40), a 20 m edge
+        let mut verts = 2i32.to_le_bytes().to_vec();
+        verts.extend(3i32.to_le_bytes());
+        for p in [[28f32, 20., 10.], [28., 40., 10.], [5., 30., 10.]] {
+            p.iter().for_each(|v| verts.extend(v.to_le_bytes()));
+            verts.extend([0u8; 16]);
+            verts.extend([1u8, 0, 0, 0]);
+        }
+        let radius = |b: &[u8]| f32_at(b, 32 + 2 * 60 + 4 + 20).unwrap();
+        let smoothed = |x: f32, _y: f32| Some((if (28.0..32.0).contains(&x) { 16.0 } else { 10.0 }, 10.0, false));
+        let mut b = block(-1.0);
+        assert_eq!(adjust_net(&mut b, (0, 0), &smoothed, Some(&verts)).unwrap().opened, 1);
+        assert_eq!(radius(&b), 10.0);
+        let flat = |_x: f32, _y: f32| Some((10.0, 10.5, false));
+        let mut b = block(-1.0);
+        assert_eq!(adjust_net(&mut b, (0, 0), &flat, Some(&verts)).unwrap().opened, 0);
+        assert_eq!(radius(&b), -1.0);
     }
 }

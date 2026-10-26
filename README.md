@@ -37,6 +37,7 @@ client's `.alb` bytecode.
 | ![Terrain](docs/screenshots/terrain_paint.jpg) **Terrain:** paint brush with the cell's surface types; a hole cut into the ground | ![Play](docs/screenshots/play.jpg) **Play (F5):** walk the edited world with a character |
 | ![Item row editor](docs/screenshots/item_editor.jpg) **Item editor:** every column of an `items` row, plus the English name and description | ![Quest row editor](docs/screenshots/quest_editor.jpg) **Quest editor:** a quest row and its `quest_components` steps |
 | ![New object](docs/screenshots/new_object.jpg) **More objects:** a new model placed from the browser of all 10,055 pak models | ![Library](docs/screenshots/world_library.jpg) **Other worlds:** `--world instance_library` |
+| ![Housing zone](docs/screenshots/housing_zone.jpg) **Housing:** zone 212 "terrorhousing1" selected, with its corners and rule set | ![Housing rules](docs/screenshots/housing_rules.jpg) **Housing rule sets:** conditions and allowed building categories |
 
 Terrain hole, before and after (it is saved into the pak overlay and reloads on restart):
 
@@ -77,14 +78,17 @@ spawn (`--preview items:18395`).
 |---|---|---|
 | **NPC / doodad spawns** | Browse every NPC and doodad by English name and search them. Place one by clicking the ground. Select, drag (snaps to ground), rotate, duplicate and delete, with an inspector for UnitId, position, yaw / pitch / roll and scale. Undo / redo. | The AAEmu spawn JSON files (`npc_spawns*.json`, `doodad_spawns*.json`). Untouched entries keep their exact text and comments. New spawns go to `*_spawns_editor.json`, and the first overwrite keeps a `.editor-orig` backup. |
 | **Models in the world** | Doodads and NPCs show their real models. Humanoid NPCs are dressed the way the server dresses them: armour from `equip_pack_cloths`, carried weapons from `equip_pack_weapons`, face and hair from `item_body_parts`, look from `total_character_customs`. Creatures get their skin attachments and an idle animation. | – |
-| **Model preview** | Turntable 3D view of any NPC (dressed, with weapons), doodad, weapon, armour worn on a chosen race and gender, item icon, or a quest's NPC. | – |
+| **Model preview** | Turntable 3D view of any NPC (dressed, with weapons), doodad, weapon, armour worn on a chosen race and gender, item icon, a quest's NPC, or the selected world object (brush, tree, prop). | – |
+| **AI paths** | Paths mode (5): the routes NPCs walk, drawn in the world with their direction and the NPCs that follow them. Drag points, Shift+click to add, delete; new, duplicate, rename, reverse, close loop, snap to ground, walk preview; per-point actions (speed, loop). Give any NPC a route (`FollowPath`), or start a new route at an NPC. Edit the AI command sets that use a route (re-point, add, remove; renames carry them along). Undo / redo. | The server's `Data/Path/*.path` (with `.editor-orig` backups, copied to the runtime folder) and the spawn files |
+| **Housing zones** | Housing mode (6): every housing zone of the world drawn on the ground, coloured by rule set. Drag corners or whole zones, Shift+click to add corners, delete them; draw new zones, duplicate, rename, delete. Pick each zone's area row and rule set. Edit the rule sets: English name and description, houseless only, not if owning a category, can extend, tax delay, doodad, the allowed building categories; new (copy) and delete. Undo / redo. | The zones' `housing_area.xml` in the pak overlay and the server's `ClientOverlay` (byte-identical for untouched zones, `.editor-orig` backups); `housing_areas`, `housing_groups`, `housing_group_categories` in the database |
 | **Game database** | Row editor for NPCs, doodads, items and quests: every column, plus the English name and description. Changed fields are highlighted. Save, revert, clone as a new row (`MAX(id)+1`, texts copied) or delete. Quests list their steps, and "go to" flies to the step's NPC. | AAEmu's `compact.sqlite3`, one transaction per action. `--read-only-db` locks it. |
 | **Terrain** | Sculpt brushes: raise, lower, smooth and flatten, each with a radius and strength. **Paint** surface types from the cell's own list, with thumbnails. **Hole** cuts or fills holes. **Tint** blends the baked cover colour, and Alt+click picks a colour. Undo per stroke. | `heightmap.dat` and `cover.ctc` per edited cell, in a pak overlay folder that the editor and the remade client both read (`AA_PAK_OVERLAY`). |
-| **New surface types** | Paint any material the world uses (317 in main_world) into a cell that doesn't list it yet. | That cell's `leveldata.xml` in the pak overlay |
+| **New surface types** | Paint any material the world uses (317 in main_world) into a cell that doesn't list it yet; with "more materials", also the other worlds' and every `aa_terrain` material of the pak (the terrain reloads to draw these when the stroke ends). | That cell's `leveldata.xml` in the pak overlay |
 | **World objects** | Pick static brushes, vegetation and entity props (`brush.dat`, `object.dat`, `vegetation.dat`, `entities.xml`). Move, rotate, raise / lower, scale, copy and delete them. Objects follow terrain you sculpt under them. | The same binary formats in the pak overlay. Parse → write is byte-identical for every main_world cell. |
-| **More objects** | Place new brushes and vegetation from a browser of every `objects/**.cgf` in the pak. Select, move and delete decals, roads, water volumes and interior (`visareas.dat`) brushes. | `brush.dat` / `statobjs.dat` / `object.dat` / `vegetation.dat` / `visareas.dat` in the pak overlay. Untouched bytes stay the same. |
+| **More objects** | Place new brushes and vegetation from a browser of every `objects/**.cgf` in the pak. Decals, roads and water: move, copy into new ones, delete, and reshape with handles in the view (road nodes and edge points, water outline points); water redraws at once; roads and decals save and redraw when you let go (or with "Save and redraw" when that is off). Interior (`visareas.dat`) brushes: move and delete. | `brush.dat` / `statobjs.dat` / `object.dat` / `vegetation.dat` / `visareas.dat` in the pak overlay. Untouched bytes stay the same. |
 | **Pak export** | Writes the overlay into a real `game_pak` that the original client reads. It patches in place like the original patcher (same slot, a free block, or appended), rewrites the MD5, table and header, and writes an undo file. "Undo last export" restores the pak byte for byte. | A `game_pak` you choose. Use a **copy** of your client: the original client folder is refused. |
-| **Server terrain** | Exports edited cells as a client-file overlay that the AAEmu Rust server reads for heights, and adds it to the server's `ClientData.Sources`. Also moves the navmesh (`paths/*.bai`) with the edited ground and blocks links over new holes. | `<server-data>/ClientOverlay/...` plus `Config.Local.json` (backup kept). The navmesh files also go to the pak overlay, with `.editor-orig` backups. |
+| **Server terrain** | Exports edited cells as a client-file overlay that the AAEmu Rust server reads for heights, and adds it to the server's `ClientData.Sources`. Also updates the navmesh (`paths/*.bai`): it moves with the edited ground, links over new holes, sculpted walls and too steep slopes are blocked, links over smoothed cliffs reopen, and triangles under sculpted hills and valleys are split so NPC heights and paths follow them. | `<server-data>/ClientOverlay/...` plus `Config.Local.json` (backup kept). The navmesh files also go to the pak overlay, with `.editor-orig` backups. |
+| **Worlds and navigation** | The world menu (🌐) lists every world in the pak and restarts the editor on the one you pick, asking first about unsaved changes. A gizmo in the top-right corner of the view orbits (drag), looks along an axis (click X / Y / Z), zooms and pans. **Teleport (M)** opens a relief map of the world to click on, plus a searchable list of zones, the server's respawn / recall / world gate points and start point, your bookmarks, NPCs and doodads by name, and an `x, y[, z]` box. View → Fog turns the time of day's fog off (`arche_mall_world` and `instance_hadir_farm` are authored with a dense one). | Bookmarks: `data/local/editor/bookmarks.json` |
 | **Play (F5)** | A Nuian character walks the edited terrain: WASD, Shift to run, Space to jump, right mouse to turn. They fall through holes. | – |
 | **Play on server** | Shows the server's port status and can restart a local AAEmu lane (it asks twice). "Save all and launch client" starts the remade client against it with your overlay, and can `/move` you to the camera position (GM account). | – |
 
@@ -102,19 +106,19 @@ spawn (`--preview items:18395`).
 
 ### Not supported yet
 
-* The navmesh follows height edits only. No triangles or links are added, and sculpted walls don't block NPC paths.
-* A new surface type must be a material that some cell of the same world already uses.
-* Decals, roads and water can only be moved or deleted whole: no reshaping and no new ones. They redraw after "Reload
-  objects" or a restart.
+* The navmesh's forbidden areas (`areasmission`) aren't edited, and the new triangles and links haven't been walked by
+  the server's NPCs yet (they were checked against the server's file rules).
+* Textures that aren't in the pak can't be added as surface types.
+* Roads and decals redraw by saving (no unsaved preview of their drawn shape). Decal size and interior area / portal shapes are
+  not editable.
 * In-editor Play has no server, so no NPC AI or quests. Use "Play on server" for that.
 * Pak export is verified by reading the pak back. It has not been tested end to end on a full original-client copy.
 * UI editor:
   * Compiled scripts load in the remade client's Lua but have not been tested in the original client.
   * The game data is fake, so windows the fakes don't drive (auction, mail, housing …) may be empty.
-  * The English client hides its login window, because it logged in through a launcher.
+  * The login screen builds and can be edited through the tree and inspector, but `aa-ui` draws nothing for it yet.
   * Translucent panels blend slightly lighter than in game.
-* Checked worlds: main_world, instance_library and instance_prologue, plus a round-trip test over instance_sal_temple
-  and arche_mall_world. Windows is the only platform tested.
+* Windows is the only platform tested.
 
 ## Requirements
 
@@ -169,13 +173,19 @@ Both editors share the pak overlay (`data/local/editor/overlay`), so one Pak exp
 |---|---|
 | `--world <name>` | world to load (default `main_world`) |
 | `--pos x,y[,z]` | start camera position, in server / CryEngine coordinates |
+| `--look yaw,pitch` | start camera direction in degrees (yaw 0 = north, clockwise; pitch -90 = straight down) |
+| `--no-fog` | start with the time of day's fog off (View → Fog), for worlds authored with a dense one |
 | `--spawn-dir <dir>` | the `Data/Worlds/<world>` folder spawns are read from and saved to |
 | `--mirror <dir>` | also copy saved spawn files here (repeatable), e.g. the server's runtime folder |
 | `--db <file>` / `--read-only-db` | the game database to edit / never write it |
 | `--overlay <dir>` | pak overlay folder for terrain and object saves (default `data/local/editor/overlay`) |
-| `--mode select\|place\|terrain\|objects`, `--play` | start in that mode |
+| `--mode select\|place\|terrain\|objects\|paths\|housing`, `--play` | start in that mode |
 | `--select <unit_id>`, `--row <npcs\|doodads\|items\|quests>:<id>` | select a spawn / open a database row at start |
 | `--preview <npcs\|doodads\|items\|quests>:<id>` | open the model preview on that row |
+| `--teleport` | open the teleport window at start |
+| `--mode paths`, `--path <name>`, `--path-dir <dir>` | start in Paths mode / on that route; the server's `Data/Path` folder |
+| `--mode housing`, `--housing <area id>`, `--housing-tab rules` | start in Housing mode / on the zone of that `housing_areas` id / on the rule sets |
+| `--preview-open` | open the model preview at start (it follows the selection) |
 | `--add-surface`, `--more-objects` | open the "Add surface types" / "More objects" windows |
 | `--export-pak <game_pak>` | export the overlay into that pak at startup |
 | `--server-data <dir>`, `--server-config <file>` | the AAEmu server data folder / config for "Server terrain" |
@@ -201,9 +211,13 @@ Environment variables:
 | Del, Ctrl+D, F | delete, duplicate, focus |
 | Ctrl+Z / Ctrl+Y | undo / redo |
 | Ctrl+S | save everything |
+| M | teleport map |
+| `5`, Shift+click, Del | Paths mode; add a route point; remove it |
+| `6`, Shift+click, Del, Enter | Housing mode; add a zone corner; remove it; close a new zone |
+| Gizmo (top right of the view) | drag to orbit, click an axis to look along it, drag 🔍 to zoom, ✋ to pan |
 | F5 / Esc | play / stop |
 
-The server reads spawns and the database only at startup, so **restart your AAEmu game server** after saving them.
+The server reads spawns, AI paths, housing zones and the database only at startup, so **restart your AAEmu game server** after saving them.
 Terrain and UI edits only need the client (through the overlay or a pak export).
 
 ### UI editor keys
@@ -218,12 +232,16 @@ open the client's windows.
 cargo test -p aa-editor -p aa-ui-editor
 ```
 
-* **World editor (41 tests):**
+* **World editor (75 tests):**
   * the JSON-with-comments rewriter and the spawn store
   * the heightmap, cover, navmesh and `leveldata.xml` writers
   * byte-identical round trips of the object files of several worlds
   * the pak writer and its undo
   * the server config edit and NPC dressing
+  * the gizmo's axis views, the world-switch command line, the teleport places of main_world
+  * housing zones: all 113 zone files of the pak regenerate byte for byte; new, moved and deleted zones; rule set edits written and read back
+  * AI route files, `FollowPath` and AI command edits, navmesh walls, reopened links and split triangles, road / water reshaping, more surface materials
+  * every world of the pak: placement files write back byte for byte, heightmaps within quantisation
 * **UI editor (13 tests):**
   * the source patcher: every `AddAnchor` form, computed arguments, the creation-line fallback
   * `.alb` compilation: all 961 decompiled scripts compile and load back

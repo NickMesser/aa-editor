@@ -297,6 +297,42 @@ impl GameData {
             .flatten()
     }
 
+    /// The FollowPath AI commands (`ai_commands.cmd_id = 2`), ordered by route and set.
+    pub fn path_commands(&self) -> Vec<PathCommand> {
+        read_path_commands(&self.lock())
+    }
+
+    /// Every AI command set: (id, name).
+    pub fn command_sets(&self) -> Vec<(u32, String)> {
+        let conn = self.lock();
+        let Ok(mut st) = conn.prepare("SELECT id, COALESCE(name, '') FROM ai_command_sets ORDER BY id") else {
+            return Vec::new();
+        };
+        st.query_map([], |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Writes the FollowPath commands `now` over `before` (as [`read_path_commands`] gave them) in one transaction;
+    /// returns the rows changed.
+    pub fn save_path_commands(&mut self, before: &[PathCommand], now: &[PathCommand]) -> Result<usize> {
+        self.check_writable()?;
+        write_path_commands(self.conn.get_mut().unwrap_or_else(|e| e.into_inner()), before, now)
+    }
+
+    /// The housing rule tables ([`crate::housing`]).
+    pub fn housing_rules(&self) -> Result<crate::housing::Rules> {
+        Ok(crate::housing::read_rules(&self.lock())?)
+    }
+
+    pub fn housing_labels(&self) -> crate::housing::Labels {
+        crate::housing::read_labels(&self.lock())
+    }
+
+    /// Writes the housing rule changes from `before` to `now` (one transaction); returns the rows written.
+    pub fn save_housing_rules(&mut self, before: &crate::housing::Rules, now: &crate::housing::Rules) -> Result<usize> {
+        self.check_writable()?;
+        crate::housing::write_rules(self.conn.get_mut().unwrap_or_else(|e| e.into_inner()), before, now)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -469,6 +505,64 @@ pub fn component_kind(kind: u32) -> &'static str {
     }
 }
 
+/// A FollowPath AI command (`ai_commands` row with `cmd_id = 2`): the NPCs of command set `set` walk `route`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathCommand {
+    /// Row id; 0 for a row not in the database yet.
+    pub id: u32,
+    pub set: u32,
+    pub set_name: String,
+    /// `param1` (1 for most rows, 2 for some), kept as is.
+    pub param1: i64,
+    /// `param2`: the route name.
+    pub route: String,
+}
+
+pub fn read_path_commands(conn: &Connection) -> Vec<PathCommand> {
+    let Ok(mut st) = conn.prepare(
+        "SELECT c.id, c.cmd_set_id, COALESCE(s.name, ''), COALESCE(c.param1, 1), c.param2 FROM ai_commands c          LEFT JOIN ai_command_sets s ON s.id = c.cmd_set_id WHERE c.cmd_id = 2 AND TRIM(COALESCE(c.param2, '')) <> ''          ORDER BY c.param2, c.cmd_set_id, c.id",
+    ) else {
+        return Vec::new();
+    };
+    st.query_map([], |r| {
+        Ok(PathCommand {
+            id: r.get::<_, i64>(0)? as u32,
+            set: r.get::<_, i64>(1)? as u32,
+            set_name: r.get(2)?,
+            param1: r.get(3)?,
+            route: r.get::<_, String>(4)?.trim().to_string(),
+        })
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
+}
+
+/// Deletes the rows of `before` missing from `now`, updates the changed ones and inserts the new ones (id 0, numbered
+/// after the table's last id, so they run after the set's other commands).
+pub fn write_path_commands(conn: &mut Connection, before: &[PathCommand], now: &[PathCommand]) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let mut changed = 0;
+    for b in before.iter().filter(|b| !now.iter().any(|n| n.id == b.id)) {
+        changed += tx.execute("DELETE FROM ai_commands WHERE id = ?1 AND cmd_id = 2", params![b.id])?;
+    }
+    for n in now {
+        if n.id == 0 {
+            tx.execute(
+                "INSERT INTO ai_commands (id, cmd_set_id, cmd_id, param1, param2)                  VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM ai_commands), ?1, 2, ?2, ?3)",
+                params![n.set, n.param1, n.route],
+            )?;
+            changed += 1;
+        } else if before.iter().any(|b| b.id == n.id && b != n) {
+            changed += tx.execute(
+                "UPDATE ai_commands SET cmd_set_id = ?1, param1 = ?2, param2 = ?3 WHERE id = ?4 AND cmd_id = 2",
+                params![n.set, n.param1, n.route, n.id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +585,9 @@ mod tests {
         let row = db.row(Table::Items, db.lists[&Table::Items][0].id).unwrap();
         assert!(row.iter().any(|f| f.column == "price"));
         assert!(db.update_row(Table::Items, 1, &[], &[]).is_err(), "read-only refuses writes");
+        let commands = db.path_commands();
+        assert!(commands.len() > 200 && commands.iter().all(|c| c.id > 0 && !c.route.is_empty()));
+        assert!(db.save_path_commands(&commands, &[]).is_err(), "read-only refuses command writes");
     }
 
     #[test]
@@ -515,5 +612,32 @@ mod tests {
             assert!(db.entry(Table::Items, new_id).is_none());
         }
         let _ = std::fs::remove_file(&copy);
+    }
+
+    #[test]
+    fn path_commands_are_repointed_added_and_removed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_commands (id INTEGER, cmd_set_id INTEGER, cmd_id INTEGER, param1 INTEGER, param2 TEXT);
+             CREATE TABLE ai_command_sets (id INTEGER, name TEXT, can_interact TEXT);
+             INSERT INTO ai_command_sets VALUES (76, 'kron', 'f'), (82, 'wish', 'f');
+             INSERT INTO ai_commands VALUES (1058, 76, 2, 1, 'long_quest_kron_01'), (1059, 76, 4, 1, '0'),
+                 (1061, 76, 2, 1, 'long_quest_kron_01'), (1186, 82, 2, 2, 'AIPath_140_wish_49');",
+        )
+        .unwrap();
+        let before = read_path_commands(&conn);
+        assert_eq!(before.len(), 3, "only cmd_id 2 rows");
+        assert_eq!((before[0].id, before[0].route.as_str(), before[0].set_name.as_str()), (1186, "AIPath_140_wish_49", "wish"));
+        let mut now = before.clone();
+        now[0].route = "new_route".into(); // re-point
+        now.retain(|c| c.id != 1061); // remove
+        now.push(PathCommand { id: 0, set: 82, set_name: "wish".into(), param1: 1, route: "added".into() });
+        assert_eq!(write_path_commands(&mut conn, &before, &now).unwrap(), 3);
+        let after = read_path_commands(&conn);
+        let routes: Vec<(u32, u32, &str)> = after.iter().map(|c| (c.id, c.set, c.route.as_str())).collect();
+        assert_eq!(routes, vec![(1187, 82, "added"), (1058, 76, "long_quest_kron_01"), (1186, 82, "new_route")]);
+        let other: i64 = conn.query_row("SELECT COUNT(*) FROM ai_commands WHERE cmd_id <> 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(other, 1, "other commands untouched");
+        assert_eq!(write_path_commands(&mut conn, &after, &after).unwrap(), 0);
     }
 }

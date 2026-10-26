@@ -16,6 +16,8 @@
 //!
 //! * `--world <name>`        default `main_world`
 //! * `--pos x,y[,z]`         start camera position (cry / server coordinates)
+//! * `--no-fog`              start with the atmosphere fog off (View > Fog)
+//! * `--look yaw,pitch`      start camera direction in degrees (yaw 0 = north, clockwise; pitch -90 = straight down)
 //! * `--spawn-dir <dir>`     the server's `Data/Worlds/<world>` folder the spawn files are read from and saved to
 //!   (default: the bevy lane's source tree `D:/aaemu-wt/bevy/rust/crates/aaemu-game/app/Data/Worlds/<world>`)
 //! * `--mirror <dir>`        another folder that receives a copy of saved spawn files (repeatable; default: the lane's
@@ -24,16 +26,23 @@
 //! * `--read-only-db`        never write the database
 //! * `--overlay <dir>`       pak overlay folder for terrain saves (default `data/local/editor/overlay`)
 //! * `--select <unit_id>`    select the first spawn of this NPC / doodad template near the start (for screenshots)
-//! * `--mode <select|place|terrain>`, `--play` start in that mode
+//! * `--mode <select|place|terrain|objects|paths|housing>`, `--play` start in that mode
 //! * `--row <npcs|doodads|items|quests>:<id>` open that database row in the row editor
 //! * checks: `--sculpt x,y` holds the terrain brush there for 120 frames (`--brush-radius`, `--brush-strength`),
 //!   `--sculpt-save` then saves the terrain
 //! * `--preview <npcs|doodads|items|quests>:<id>` open the model preview with that row
 //! * `--export-pak <game_pak>` exports the pak overlay into that pak at startup ([`pak_export`]; never `D:/AA1.2`)
 //!
+//! * `--teleport`            open the teleport window at start
+//! * `--path-dir <dir>`      the server's `Data/Path` folder of AI routes ([`paths`]; default: next to the spawn folder)
+//! * `--switch-world <name>` check: switch to that world (restart) once running
+//! * `--housing <area id>`   start in Housing mode with the zone of that `housing_areas` id selected ([`housing`]);
+//!   `--housing-nudge dx,dy` (check) then moves it and saves
+//!
 //! Controls: hold the right mouse button to look, WASD / Space / Ctrl to fly (Shift fast), left click to select or
 //! place, drag the selection to move it, `[` `]` or Shift + wheel to turn it, Delete, Ctrl+D duplicate, Ctrl+Z / Ctrl+Y,
-//! Ctrl+S save, F focus, F5 play, Esc stop.
+//! Ctrl+S save, F focus, F5 play, Esc stop, M teleport map. The gizmo in the top-right corner of the view orbits
+//! (drag), looks along an axis (click), zooms and pans ([`nav`]); the world menu restarts on another world ([`worlds`]).
 
 // Bevy systems take many parameters and nested query types.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -41,11 +50,16 @@
 mod camera;
 mod db;
 mod heightmap_write;
+mod housing;
 mod jsonc;
 mod model_preview;
+mod nav;
 mod navmesh;
+mod navmesh_add;
 mod objects_extra;
+mod paths;
 mod surface_add;
+mod teleport;
 mod pak_export;
 mod npc_look;
 mod play;
@@ -60,6 +74,7 @@ mod tools;
 mod ui;
 mod views;
 mod world_objects;
+mod worlds;
 
 use std::path::PathBuf;
 
@@ -91,6 +106,10 @@ pub enum Mode {
     Terrain,
     /// Static world objects of the cell files (brushes, vegetation, entities).
     Objects,
+    /// The AI routes NPCs walk ([`paths`]).
+    Paths,
+    /// Housing zones and their rules ([`housing`]).
+    Housing,
 }
 
 /// Where things are saved.
@@ -117,6 +136,8 @@ pub struct Editor {
     pub view_radius: f32,
     pub show_npcs: bool,
     pub show_doodads: bool,
+    /// The time of day's atmosphere fog (`--no-fog` starts with it off).
+    pub fog: bool,
     pub snap_to_ground: bool,
     pub status: String,
     /// Open row editor.
@@ -138,6 +159,18 @@ pub enum Request {
     PlayOnServer,
     /// Save the edited static world objects ([`world_objects`]).
     SaveObjects,
+    /// Move the camera above a cry-space point (`z` NaN: the ground there) ([`nav`]).
+    Teleport(Vec3),
+    /// Look down at a cry-space point from this many metres ([`nav`]): frames a large thing like a housing zone.
+    View(Vec3, f32),
+    /// Open / close the teleport window ([`teleport`]).
+    OpenTeleport,
+    /// Restart the editor on another world ([`worlds`]).
+    SwitchWorld(String),
+    /// Save the edited AI routes ([`paths`]).
+    SavePaths,
+    /// Save the edited housing zones and rules ([`housing`]).
+    SaveHousing,
 }
 
 impl Editor {
@@ -193,19 +226,22 @@ fn main() {
     };
     let anim_db = aa_anim::GameDb::open().map_err(|e| eprintln!("humanoid previews off: {e}")).ok().map(std::sync::Mutex::new);
 
+    let look = vec_arg("--look").filter(|v| v.len() >= 2).map_or((0.0, -20.0), |v| (v[0], v[1]));
     let start = match vec_arg("--pos") {
         Some(v) if v.len() >= 3 => Vec3::new(v[0], v[1], v[2]),
         Some(v) => {
             let ground = aa_world::TerrainQuery::new(&world).height_at(v[0], v[1]).unwrap_or(100.0);
             Vec3::new(v[0], v[1], ground + 25.0)
         }
-        // the Nuia new-character spawn, from above
-        None => Vec3::new(15560.0, 15350.0, 160.0),
+        // main_world: the Nuia new-character spawn, from above; else the server's start point
+        None => worlds::start_camera(&world, &worlds::data_dirs(&spawn_dir)),
     };
     let mode = match arg("--mode").as_deref() {
         Some("place") => Mode::Place,
         Some("terrain") => Mode::Terrain,
         Some("objects") => Mode::Objects,
+        Some("paths") => Mode::Paths,
+        Some("housing") => Mode::Housing,
         _ => Mode::Select,
     };
     let editor = Editor {
@@ -219,6 +255,7 @@ fn main() {
         view_radius: 220.0,
         show_npcs: true,
         show_doodads: true,
+        fog: !flag("--no-fog"),
         snap_to_ground: true,
         status: "ready".into(),
         row: None,
@@ -246,9 +283,10 @@ fn main() {
         .add_plugins(surface_add::plugin)
         .add_plugins(objects_extra::plugin)
         .add_plugins(model_preview::plugin)
+        .add_plugins((nav::plugin, teleport::plugin, worlds::plugin, paths::plugin, housing::plugin))
         .add_systems(Startup, move |mut commands: Commands| {
             let transform = Transform::from_translation(cry_to_bevy(start))
-                .with_rotation(Quat::from_rotation_y(0.0) * Quat::from_rotation_x(-0.35));
+                .with_rotation(Quat::from_rotation_y(-look.0.to_radians()) * Quat::from_rotation_x(look.1.to_radians()));
             commands.spawn((
                 Camera3d::default(),
                 Projection::Perspective(PerspectiveProjection { fov: 60f32.to_radians(), near: 0.3, far: 20000.0, ..default() }),

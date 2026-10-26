@@ -2,7 +2,8 @@
 //!
 //! Entry format (case-insensitive keys, `//` comments allowed, angles in degrees, Cry space: Z up):
 //! `{"UnitId": 502, "Position": {"X": 23039.76, "Y": 11540.64, "Z": 252.7, "Yaw": -36.5625}}`.
-//! `UnitId` is `npcs.id` / `doodad_almighties.id`. The server reads every `npc_spawns*.json` /
+//! `UnitId` is `npcs.id` / `doodad_almighties.id`. An NPC entry may name the AI route it walks: `"FollowPath": "<name>"`
+//! (`Data/Path/<name>.path`, see [`crate::paths`]). The server reads every `npc_spawns*.json` /
 //! `doodad_spawns*.json` of the folder, so new spawns go to `*_spawns_editor.json` and the retail
 //! files are only rewritten when one of their entries was moved or deleted (untouched entries keep
 //! their exact text, comments included).
@@ -48,11 +49,13 @@ pub struct Placement {
     pub roll: f32,
     pub scale: f32,
     pub deleted: bool,
+    /// `FollowPath`: index into [`SpawnStore::path_names`], 0 = none.
+    pub path: u16,
 }
 
 impl Placement {
     pub fn new(unit_id: u32, pos: Vec3, yaw: f32) -> Self {
-        Placement { unit_id, pos, yaw, pitch: 0.0, roll: 0.0, scale: 1.0, deleted: false }
+        Placement { unit_id, pos, yaw, pitch: 0.0, roll: 0.0, scale: 1.0, deleted: false, path: 0 }
     }
 
     /// Bevy-space rotation of a model placed with this spawn (yaw about Cry Z, counter-clockwise from north).
@@ -101,6 +104,8 @@ pub struct SpawnStore {
     redo: Vec<Vec<Step>>,
     /// Incremented on every change, so views know to refresh.
     pub generation: u64,
+    /// `FollowPath` names; index 0 is "no path".
+    pub path_names: Vec<String>,
 }
 
 fn get_ci<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
@@ -134,6 +139,7 @@ fn placement_of(v: &Value) -> Option<Placement> {
         roll: f("Roll"),
         scale: num(obj, "Scale").map(|s| s as f32).filter(|s| *s > 0.0).unwrap_or(1.0),
         deleted: false,
+        path: 0,
     })
 }
 
@@ -166,14 +172,11 @@ impl SpawnStore {
                 let source = &text[s..e];
                 let value: Option<Value> = serde_json::from_str(&jsonc::strip_comments(source)).ok();
                 match value.as_ref().and_then(placement_of) {
-                    Some(p) => store.spawns.push(Spawn {
-                        kind,
-                        file,
-                        now: p,
-                        value,
-                        source: Some(source.to_string()),
-                        original: Some(p),
-                    }),
+                    Some(mut p) => {
+                        let follow = value.as_ref().and_then(Value::as_object).and_then(|o| get_ci(o, "FollowPath")).and_then(Value::as_str);
+                        p.path = follow.map_or(0, |n| store.path_id(n));
+                        store.spawns.push(Spawn { kind, file, now: p, value, source: Some(source.to_string()), original: Some(p) });
+                    }
                     None => bad += 1,
                 }
             }
@@ -187,7 +190,22 @@ impl SpawnStore {
 
     /// A store without spawns that saves new ones into `dir`.
     pub fn empty(dir: &Path) -> SpawnStore {
-        SpawnStore { dir: dir.to_path_buf(), ..default() }
+        SpawnStore { dir: dir.to_path_buf(), path_names: vec![String::new()], ..default() }
+    }
+
+    /// The index of a `FollowPath` name ("" is 0, no path).
+    pub fn path_id(&mut self, name: &str) -> u16 {
+        let name = name.trim();
+        if let Some(i) = self.path_names.iter().position(|n| n == name) {
+            return i as u16;
+        }
+        self.path_names.push(name.to_string());
+        (self.path_names.len() - 1) as u16
+    }
+
+    /// The `FollowPath` of a placement.
+    pub fn path_of(&self, p: &Placement) -> Option<&str> {
+        self.path_names.get(p.path as usize).map(String::as_str).filter(|n| !n.is_empty())
     }
 
     fn editor_file(&mut self, kind: Kind) -> usize {
@@ -285,7 +303,7 @@ impl SpawnStore {
     }
 
     /// The JSON text of one entry.
-    fn entry_text(spawn: &Spawn, name: Option<&str>) -> String {
+    fn entry_text(spawn: &Spawn, name: Option<&str>, path_names: &[String]) -> String {
         if spawn.original == Some(spawn.now)
             && let Some(src) = &spawn.source {
                 return src.clone();
@@ -305,6 +323,14 @@ impl SpawnStore {
         set_ci(&mut obj, "Position", Value::Object(pos));
         if spawn.kind == Kind::Doodad && (p.scale != 1.0 || get_ci(&obj, "Scale").is_some()) {
             set_ci(&mut obj, "Scale", round(p.scale, 4));
+        }
+        match path_names.get(p.path as usize).filter(|n| !n.is_empty()) {
+            Some(name) => set_ci(&mut obj, "FollowPath", Value::from(name.as_str())),
+            None => {
+                if let Some(k) = obj.keys().find(|k| k.eq_ignore_ascii_case("FollowPath")).cloned() {
+                    obj.remove(&k);
+                }
+            }
         }
         let mut text = Vec::new();
         let mut ser = serde_json::Serializer::with_formatter(&mut text, serde_json::ser::PrettyFormatter::with_indent(b"    "));
@@ -336,7 +362,7 @@ impl SpawnStore {
             let live: Vec<String> = entries
                 .iter()
                 .filter(|s| !s.now.deleted)
-                .map(|s| Self::entry_text(s, name_of(s.kind, s.now.unit_id).as_deref()))
+                .map(|s| Self::entry_text(s, name_of(s.kind, s.now.unit_id).as_deref(), &self.path_names))
                 .collect();
             let text = if live.is_empty() { "[\n]\n".to_string() } else { format!("[\n    {}\n]\n", live.join(",\n    ")) };
             if file.path.exists() {
@@ -384,6 +410,32 @@ impl SpawnStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_path_is_read_set_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("aa-editor-follow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let retail = r#"[
+    { "UnitId": 1, "FollowPath": "walk_a", "Position": { "X": 1, "Y": 2, "Z": 3 } },
+    { "UnitId": 2, "Position": { "X": 4, "Y": 5, "Z": 6 } }
+]"#;
+        std::fs::write(dir.join("npc_spawns.json"), retail).unwrap();
+        let mut store = SpawnStore::load(&dir).unwrap();
+        assert_eq!(store.path_of(&store.spawns[0].now), Some("walk_a"));
+        assert_eq!(store.path_of(&store.spawns[1].now), None);
+        let (mut a, mut b) = (store.spawns[0].now, store.spawns[1].now);
+        a.path = 0;
+        b.path = store.path_id("walk_b");
+        store.apply(vec![(0, a), (1, b)]);
+        assert_eq!(store.changed_count(), 2);
+        store.save(&[], |_, _| None).unwrap();
+        let text = std::fs::read_to_string(dir.join("npc_spawns.json")).unwrap();
+        assert!(!text.contains("walk_a") && text.contains("\"FollowPath\": \"walk_b\""), "{text}");
+        let again = SpawnStore::load(&dir).unwrap();
+        assert_eq!(again.path_of(&again.spawns[1].now), Some("walk_b"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn untouched_entries_keep_their_text_and_edits_round_trip() {

@@ -11,14 +11,17 @@
 //!   saved by the Objects tools (Ctrl+S).
 //! * **Decals / roads / water** live in the `object.dat` octree (item types 9, 13, 11; layouts in
 //!   `aa_world::placement`). They can be moved (whole object: box, position, spline / outline points, the water
-//!   plane) and deleted, editing the same octree the Objects tools save, so untouched bytes stay as they were. The
-//!   streamer builds their meshes once when a cell loads, so the drawn geometry changes after "Reload objects"
-//!   (which drops and reloads every loaded cell's objects from the files: save first); until then the outlines show
-//!   the edited place.
+//!   plane), reshaped with handles in the view (road nodes and edge points, water outline points; [`shape`]), copied
+//!   (a new item of the octree) and deleted, editing the same octree the Objects tools save, so untouched bytes stay
+//!   as they were. Water is drawn again at once. The streamer builds road and decal meshes once when a cell loads, so
+//!   with "Redraw roads and decals at once" (on by default) a change to one saves the objects and reloads the loaded
+//!   cells' objects from the files when the handle is let go (like "Save and redraw"; "Reload objects" only reloads).
 //! * **Interior brushes** (`visareas.dat`: area / portal records, each with its own small octree) can be moved and
 //!   deleted; the drawn brush follows at once. Saved with Ctrl+S next to the other files of the cell.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub(crate) mod shape;
 
 use aa_cry::scene::{CryAssets, ModelOptions, spawn_loaded};
 use aa_world::coords::cell_origin;
@@ -255,6 +258,15 @@ struct Interiors {
 
 // ---------------------------------------------------------------------------------------------------------------
 
+impl Extra {
+    /// A road or decal (or, after an undo, any item) changed: redraw it once the change is done, when that is on.
+    pub fn changed(&mut self, kind: Option<ExtraKind>) {
+        if self.redraw_at_once && kind.is_none_or(|k| matches!(k, ExtraKind::Road | ExtraKind::Decal)) {
+            self.redraw = true;
+        }
+    }
+}
+
 /// What the window works on.
 #[derive(Resource, Default)]
 pub struct Extra {
@@ -276,7 +288,17 @@ pub struct Extra {
     /// Select this new object after the Objects tools ran.
     select: Option<ObjectPart>,
     reload: bool,
+    /// Save and redraw after each road / decal change ([`Extra::changed`]).
+    pub redraw_at_once: bool,
+    redraw: bool,
     pub status: String,
+    /// Handles of the selected decal / road / water ([`shape`]).
+    grip_hover: Option<shape::Grip>,
+    grip_drag: Option<shape::GripDrag>,
+    undo: Vec<shape::Step>,
+    /// Cells whose water must be meshed again, and the editor's water entities of each cell.
+    water_dirty: HashSet<(i32, i32)>,
+    live_water: HashMap<(i32, i32), Vec<Entity>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,8 +316,10 @@ enum Tab {
 }
 
 pub fn plugin(app: &mut App) {
-    app.insert_resource(Extra { open: crate::flag("--more-objects"), step: 1.0, ..default() })
+    app.insert_resource(Extra { open: crate::flag("--more-objects"), step: 1.0, redraw_at_once: true, ..default() })
         .add_systems(Update, (focus_cell, ghost, place, scripted, draw).chain().after(crate::tools::update_cursor))
+        .add_systems(Update, shape::grip_input.after(crate::tools::update_cursor).before(crate::world_objects::pick))
+        .add_systems(Update, (shape::draw_grips, shape::live_water))
         .add_systems(Update, save_interiors.after(scripted).after(crate::tools::keys).before(crate::world_objects::save_requests))
         .add_systems(PostUpdate, select_new)
         .add_systems(Last, reload_objects)
@@ -308,7 +332,7 @@ fn cell_of(p: Vec3) -> (i32, i32) {
 
 /// The lists follow the cell under the cursor (else the camera).
 fn focus_cell(editor: Res<Editor>, cursor: Res<Cursor>, camera: Query<&Transform, With<crate::camera::EditorCamera>>, mut extra: ResMut<Extra>) {
-    if editor.mode != Mode::Objects || !extra.open || extra.placing.is_some() {
+    if editor.mode != Mode::Objects || !extra.open || extra.placing.is_some() || extra.grip_drag.is_some() {
         return;
     }
     let at = cursor.ground.or_else(|| camera.single().ok().map(|t| aa_world::bevy_to_cry(t.translation)));
@@ -760,8 +784,25 @@ fn scripted(
             Some(&i) if delete || d.len() == 3 => {
                 extra.selected = Some((kind, i));
                 let delta = (!delete).then(|| Vec3::new(d[0], d[1], d[2]));
-                edit(&mut extra, cell, kind, i, delta);
-                format!("{} #{i} of cell {c:?} {}", kind.label(), if delete { "deleted".to_string() } else { format!("moved by {delta:?}") })
+                // `--extra-grip <n>`: move that outline / edge point instead of the whole item
+                let grip = crate::arg("--extra-grip").and_then(|g| g.parse::<usize>().ok());
+                match (grip, delta, cell.octree.as_mut().and_then(|t| t.items.get_mut(i))) {
+                    (Some(g), Some(d), Some(item)) if kind != ExtraKind::Interior => {
+                        shape::move_grip(kind, &mut item.bytes, shape::Grip::Point(g), d);
+                        cell.unsaved.insert(File::Object);
+                        cell.edited = true;
+                    }
+                    _ => {
+                        edit(&mut extra, cell, kind, i, delta);
+                    }
+                }
+                if kind == ExtraKind::Water {
+                    extra.water_dirty.insert(c);
+                }
+                extra.changed(Some(kind));
+                let at = cell.octree.as_ref().and_then(|t| t.items.get(i)).and_then(|it| shape::grips(kind, &it.bytes).first().map(|g| g.1));
+                let at = at.map(|p| p + aa_world::coords::cell_origin(c.0, c.1));
+                format!("{} #{i} of cell {c:?} (now at {at:?}) {}", kind.label(), if delete { "deleted".to_string() } else { format!("moved by {delta:?} (grip {grip:?})") })
             }
             _ => format!("no {} in cell {c:?}", kind.label()),
         };
@@ -846,13 +887,16 @@ fn save_interiors(mut editor: ResMut<Editor>, mut extra: ResMut<Extra>) {
     }
 }
 
-/// "Reload objects": every loaded cell's objects are dropped and read again from the files (pak plus overlay).
+/// "Reload objects": every loaded cell's objects are dropped and read again from the files (pak plus overlay), once a
+/// pending save has written them.
 fn reload_objects(world: &mut World) {
+    let saving = world.get_resource::<Editor>().is_some_and(|e| e.requests.iter().any(|r| matches!(r, Request::SaveObjects)));
     let Some(mut extra) = world.get_resource_mut::<Extra>() else { return };
-    if !std::mem::take(&mut extra.reload) {
+    if saving || !std::mem::take(&mut extra.reload) {
         return;
     }
     world.resource_scope(|world, mut state: Mut<ObjectState>| state.unload_all(world));
+    shape::drop_live_water(world);
     info!("objects_extra: objects reloaded from the files");
 }
 
@@ -998,32 +1042,80 @@ fn window(
                             }
                         }
                     });
+                    let octree = k != ExtraKind::Interior;
                     if let Some(d) = delta {
+                        if octree {
+                            shape::remember(extra, cell, i);
+                        }
                         edit(extra, cell, k, i, Some(d));
+                        if k == ExtraKind::Water {
+                            extra.water_dirty.insert(c);
+                        }
+                        extra.changed(Some(k));
                     }
-                    if ui.button("Delete").clicked() {
-                        edit(extra, cell, k, i, None);
-                        extra.selected = None;
-                    }
-                    if k != ExtraKind::Interior {
-                        ui.small("The outline moves now; the drawn geometry after Ctrl+S and \"Reload objects\".");
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            if octree {
+                                shape::remember(extra, cell, i);
+                            }
+                            edit(extra, cell, k, i, None);
+                            if k == ExtraKind::Water {
+                                extra.water_dirty.insert(c);
+                            }
+                            extra.changed(Some(k));
+                            extra.selected = None;
+                        }
+                        if octree
+                            && ui.button("Copy").on_hover_text("A new item, 10 m east of this one; drag its white handle to place it").clicked()
+                            && let Some(j) = shape::duplicate(extra, cell, k, i, Vec3::new(10.0, 0.0, 0.0))
+                        {
+                            extra.selected = Some((k, j));
+                            extra.status = format!("copied {} item {i} as item {j}", k.label().to_lowercase());
+                            extra.changed(Some(k));
+                        }
+                    });
+                    if octree {
+                        ui.small(match k {
+                            ExtraKind::Road => "Drag the handles in the view: white moves the road, yellow a spline node, blue one edge point.",
+                            ExtraKind::Water => "Drag the handles in the view: white moves the water, blue one outline point. Redrawn at once.",
+                            _ => "Drag the white handle in the view to move it.",
+                        });
+                        if k != ExtraKind::Water && !extra.redraw_at_once {
+                            ui.small("The outline changes now, the drawn geometry after \"Save and redraw\".");
+                        }
                     }
                 }
             }
         }
         ui.separator();
         ui.horizontal(|ui| {
+            if ui.add_enabled(!extra.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo the last decal / road / water change").clicked()
+                && shape::undo(extra, objs)
+            {
+                extra.status = "undone".into();
+                extra.changed(None);
+            }
             if ui.button("Save (Ctrl+S)").clicked() {
                 editor.requests.push(Request::SaveObjects);
             }
-            if ui.button("Reload objects").on_hover_text("Drops every loaded cell's objects and reads them again from the files (pak + overlay). Save first.").clicked() {
+            if ui.button("Save and redraw").on_hover_text("Saves, then reloads every loaded cell's objects from the files, so roads and decals draw in their new shape").clicked() {
+                editor.requests.push(Request::SaveObjects);
+                extra.reload = true;
+            }
+            if ui.button("Reload objects").on_hover_text("Drops every loaded cell's objects and reads them again from the files (pak + overlay). Unsaved changes are kept by the tools but drawn as saved.").clicked() {
                 extra.reload = true;
             }
         });
+        ui.checkbox(&mut extra.redraw_at_once, "Redraw roads and decals at once")
+            .on_hover_text("A road or decal change saves the objects to the overlay and reloads the loaded cells' objects when you let go of the handle (a second or two)");
         if !extra.status.is_empty() {
             ui.small(extra.status.clone());
         }
     });
+    if std::mem::take(&mut extra.redraw) {
+        editor.requests.push(Request::SaveObjects);
+        extra.reload = true;
+    }
     extra.open = open;
     if !open {
         extra.placing = None;
@@ -1142,6 +1234,68 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 40, "{checked}");
+    }
+
+    /// Every world of the pak (main_world too with `AA_EDITOR_ALL_WORLDS=1`, it takes minutes): each cell's
+    /// `object.dat`, `visareas.dat`, `brush.dat` and `vegetation.dat` write back byte for byte, and the heightmap writer
+    /// keeps an unedited `heightmap.dat` within its quantisation.
+    #[test]
+    fn every_world_round_trip() {
+        if !pak() {
+            return;
+        }
+        let pak = aa_pak::Pak::global();
+        let mut worlds: Vec<String> = pak
+            .names()
+            .filter_map(|n| n.strip_prefix("game/worlds/")?.strip_suffix("/world.g").map(str::to_string))
+            .filter(|w| w != "login2" && (w != "main_world" || std::env::var_os("AA_EDITOR_ALL_WORLDS").is_some()))
+            .collect();
+        worlds.sort();
+        assert!(worlds.len() >= 16, "{worlds:?}");
+        for w in &worlds {
+            let prefix = format!("game/worlds/{w}/cells/");
+            let (mut files, mut heights) = (0, 0);
+            for n in pak.names().filter(|n| n.starts_with(&prefix)) {
+                let file = n.rsplit('/').next().unwrap_or("");
+                let same = match file {
+                    "object.dat" => {
+                        let data = pak.read(n).unwrap();
+                        ObjectTree::parse(&data).unwrap_or_else(|| panic!("{n}")).write() == data
+                    }
+                    "visareas.dat" => {
+                        let data = pak.read(n).unwrap();
+                        aa_world::placement::parse_visareas_dat(&data).is_err() || Visareas::parse(&data).unwrap_or_else(|| panic!("{n}")).write() == data
+                    }
+                    "brush.dat" => {
+                        let data = pak.read(n).unwrap();
+                        aa_world::placement_write::SectorFile::parse_brushes(&data).is_none_or(|f| f.write() == data)
+                    }
+                    "vegetation.dat" => {
+                        let data = pak.read(n).unwrap();
+                        aa_world::placement_write::SectorFile::parse_vegetation(&data).is_none_or(|f| f.write() == data)
+                    }
+                    "heightmap.dat" => {
+                        let data = pak.read(n).unwrap();
+                        let Ok(cell) = aa_world::heightmap::CellHeights::parse(&data) else { continue };
+                        let back = aa_world::heightmap::CellHeights::parse(&crate::heightmap_write::write(&data, &cell).unwrap()).unwrap();
+                        let worst = cell.heights.iter().zip(&back.heights).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                        // a sector keeps 11 bits of height over its own range (the low 5 bits are the surface type), so
+                        // re-quantising moves a sample by at most one step of the steepest sector
+                        let (lo, hi) = cell.heights.iter().fold((f32::MAX, f32::MIN), |(a, b), &h| (a.min(h), b.max(h)));
+                        let step = (hi - lo) / 2047.0;
+                        assert!(worst < 0.05 || worst <= step, "{n}: heights moved by {worst} m (range {lo}..{hi})");
+                        assert_eq!(cell.surface, back.surface, "{n}: surface types");
+                        heights += 1;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                assert!(same, "{n} does not write back byte for byte");
+                files += 1;
+            }
+            println!("{w}: {files} placement files, {heights} heightmaps");
+            assert!(files + heights > 0, "{w}: no cell files");
+        }
     }
 
     /// `object.dat` decals / roads / water move and delete through the octree: the reader sees the moved values.

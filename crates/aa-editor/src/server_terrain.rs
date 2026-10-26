@@ -171,7 +171,10 @@ fn run_export(editor: Res<Editor>, heights: Res<Heights>, mut st: ResMut<ServerT
             r.backed_up,
             if r.registered { ", client source added to the server config" } else { "" },
             match nav {
-                Some(Ok(n)) => format!("Navmesh: {} file(s), {} point(s) moved, {} off the ground kept, {} link(s) blocked over holes. ", n.files, n.moved, n.kept, n.blocked_links),
+                Some(Ok(n)) => format!(
+                    "Navmesh: {} file(s), {} point(s) moved, {} off the ground kept, {} link(s) blocked ({} by new walls or slopes, the rest over holes), {} reopened, {} triangle(s) split into {}. ",
+                    n.files, n.moved, n.kept, n.blocked_links, n.walls, n.opened, n.split, n.children
+                ),
                 Some(Err(e)) => format!("Navmesh update failed: {e:#}. "),
                 None => String::new(),
             }
@@ -194,7 +197,7 @@ fn window(mut contexts: EguiContexts, editor: Res<Editor>, heights: Res<Heights>
         if ui.add_enabled(edited > 0, egui::Button::new(format!("Export terrain to server ({edited} cell(s))"))).clicked() {
             st.requested = true;
         }
-        ui.small("Restart the Rust game server afterwards. Navmesh (.bai) heights follow the edit; its triangles are not rebuilt.");
+        ui.small("Restart the Rust game server afterwards. The navmesh (.bai) follows the edit: heights move, links over new walls and holes close, links over smoothed ground reopen, and triangles under reshaped ground are split.");
         if !st.status.is_empty() {
             ui.separator();
             ui.small(st.status.clone());

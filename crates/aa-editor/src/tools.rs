@@ -137,7 +137,7 @@ fn click(
             }
             editor.status(format!("placed {} {id} at {:.1}, {:.1}, {:.1} (Shift-click keeps placing)", kind.label(), g.x, g.y, g.z));
         }
-        Mode::Terrain | Mode::Objects => {}
+        Mode::Terrain | Mode::Objects | Mode::Paths | Mode::Housing => {}
     }
 }
 
@@ -208,16 +208,18 @@ pub(crate) fn keys(
         editor.requests.push(Request::SaveSpawns);
         editor.requests.push(Request::SaveTerrain);
         editor.requests.push(Request::SaveObjects);
+        editor.requests.push(Request::SavePaths);
+        editor.requests.push(Request::SaveHousing);
     }
-    // Objects mode has its own undo (world_objects)
-    if ctrl && keys.just_pressed(KeyCode::KeyZ) && editor.mode != Mode::Objects {
+    // Objects, Paths and Housing modes have their own undo (world_objects, paths, housing)
+    if ctrl && keys.just_pressed(KeyCode::KeyZ) && !matches!(editor.mode, Mode::Objects | Mode::Paths | Mode::Housing) {
         if editor.mode == Mode::Terrain && heights.can_undo() {
             editor.requests.push(Request::UndoTerrain);
         } else if store.undo() {
             editor.status("undo");
         }
     }
-    if ctrl && keys.just_pressed(KeyCode::KeyY) && editor.mode != Mode::Objects && store.redo() {
+    if ctrl && keys.just_pressed(KeyCode::KeyY) && !matches!(editor.mode, Mode::Objects | Mode::Paths | Mode::Housing) && store.redo() {
         editor.status("redo");
     }
     if keys.just_pressed(KeyCode::Digit1) && !ctrl {
@@ -237,6 +239,10 @@ pub(crate) fn keys(
         if editor.mode == Mode::Place {
             editor.mode = Mode::Select;
         }
+    }
+    // in Paths and Housing modes Delete / F belong to the route / zone editor
+    if matches!(editor.mode, Mode::Paths | Mode::Housing) {
+        return;
     }
     let Some(i) = editor.selected.filter(|&i| i < store.spawns.len() && !store.spawns[i].now.deleted) else { return };
     let mut p = store.spawns[i].now;

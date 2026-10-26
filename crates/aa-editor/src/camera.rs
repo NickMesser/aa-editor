@@ -15,7 +15,16 @@ pub struct EditorCamera;
 pub struct FlySpeed(pub f32);
 
 pub fn plugin(app: &mut App) {
-    app.insert_resource(FlySpeed(40.0)).add_systems(Update, (fly, focus));
+    app.insert_resource(FlySpeed(40.0)).add_systems(Update, (fly, focus, fog));
+}
+
+/// The View panel's fog switch on the camera's post pass (some instances are authored with a dense, pinned fog).
+fn fog(editor: Res<Editor>, mut cameras: Query<&mut aa_world::post::Post, With<EditorCamera>>) {
+    for mut post in &mut cameras {
+        if post.fog != editor.fog {
+            post.fog = editor.fog;
+        }
+    }
 }
 
 fn fly(

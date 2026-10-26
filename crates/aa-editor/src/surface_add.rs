@@ -13,6 +13,13 @@
 //! 3. the cell's loaded terrain material gets the donor's shader table entry for the new slot
 //!    ([`copy_slot`]: the same projections, with the uv offsets recomputed for this cell's origin), so the new
 //!    material shows immediately; after a restart the library reads the overlay's `leveldata.xml` itself.
+//!
+//! With "more materials" ticked the catalogue also offers the materials of the other worlds' cells and every
+//! `materials/aa_terrain/**.mtl` of the pak no world uses (a `<SurfaceType>` element is written for those, with the
+//! common 0.2 detail scale). Their textures are not in this world's layer arrays yet: the brush paints them into the
+//! heightmap at once, and when the stroke ends [`redraw_terrain`] rebuilds the library from the overlay's
+//! `leveldata.xml` files (which then name them) and reloads the terrain cells, which get the unsaved edits back
+//! (`terrain_edit::refresh_new_patches`).
 
 use std::collections::HashMap;
 
@@ -38,6 +45,9 @@ pub struct Donor {
     pub slot: u8,
     /// The `<SurfaceType .../>` element as written in the donor's `leveldata.xml`.
     pub element: String,
+    /// `None`: a cell of this world (drawn at once); else where it comes from (another world's name, or `pak`), drawn
+    /// once the terrain reloads ([`redraw_terrain`]).
+    pub origin: Option<String>,
 }
 
 /// State of the "add missing surface types" option (kept inside [`SurfaceTables`] so the brush sees it).
@@ -54,6 +64,11 @@ pub struct AddState {
     filter: String,
     /// The editor's pak overlay (where `leveldata.xml` goes).
     pub overlay: std::path::PathBuf,
+    /// Also offer the other worlds' and the pak's materials ([`more_catalogue`]).
+    pub more: bool,
+    pub more_list: Option<Vec<Donor>>,
+    /// A material from outside the layer arrays was added: rebuild them once the stroke ends.
+    pub redraw: bool,
 }
 
 pub fn plugin(app: &mut App) {
@@ -62,7 +77,7 @@ pub fn plugin(app: &mut App) {
     if let Some(o) = overlay {
         app.world_mut().resource_mut::<SurfaceTables>().add.overlay = o;
     }
-    app.add_systems(Update, (build_catalogue, apply_added).chain().after(crate::tools::update_cursor))
+    app.add_systems(Update, (build_catalogue, build_more, apply_added, redraw_terrain).chain().after(crate::tools::update_cursor))
         .add_systems(EguiPrimaryContextPass, window);
 }
 
@@ -121,7 +136,8 @@ pub fn slot_or_add(tables: &mut SurfaceTables, world: &str, c: (i32, i32), mater
     if !tables.add.enabled {
         return None;
     }
-    let donor = tables.add.catalogue.as_ref()?.iter().find(|d| d.material == material)?.clone();
+    let more = tables.add.more_list.as_ref().filter(|_| tables.add.more).into_iter().flatten();
+    let donor = tables.add.catalogue.as_ref()?.iter().chain(more).find(|d| d.material == material)?.clone();
     let path = leveldata_path(world, c);
     let xml = aa_pak::Pak::global().read_string(&path).ok()?;
     let slot = parse_surface_types(&xml).len();
@@ -143,7 +159,11 @@ pub fn slot_or_add(tables: &mut SurfaceTables, world: &str, c: (i32, i32), mater
         table[slot] = Some(material.to_string());
     }
     tables.cells.insert(c, std::sync::Arc::new(table));
-    tables.add.status = format!("cell {c:?}: added {} as surface type {slot} (leveldata.xml saved to the overlay)", donor.material);
+    tables.add.status = match &donor.origin {
+        None => format!("cell {c:?}: added {} as surface type {slot} (leveldata.xml saved to the overlay)", donor.material),
+        Some(o) => format!("cell {c:?}: added {} (from {o}) as surface type {slot}; the terrain reloads to draw it when the stroke ends", donor.material),
+    };
+    tables.add.redraw |= donor.origin.is_some();
     info!("{}", tables.add.status);
     tables.add.added.push((c, slot as u8, donor));
     let i = tables.add.added.len() - 1;
@@ -203,12 +223,61 @@ pub fn catalogue(world: &str, cells: impl Iterator<Item = (i32, i32)>) -> Vec<Do
             if material.is_empty() {
                 continue;
             }
-            seen.entry(material.clone()).or_insert(Donor { material, cell: c, slot: slot as u8, element });
+            seen.entry(material.clone()).or_insert(Donor { material, cell: c, slot: slot as u8, element, origin: None });
         }
     }
     let mut list: Vec<Donor> = seen.into_values().collect();
     list.sort_by(|a, b| a.material.rsplit('/').next().cmp(&b.material.rsplit('/').next()));
     info!("surface types: {} materials in the world's cells ({:.0} ms)", list.len(), started.elapsed().as_secs_f32() * 1000.0);
+    list
+}
+
+/// The materials this world's cells do not use: the other worlds' (with their elements), then the pak's
+/// `materials/aa_terrain/**.mtl` that no world uses (with a written element). Sorted by file name.
+pub fn more_catalogue(world: &str, known: &std::collections::HashSet<String>) -> Vec<Donor> {
+    let started = std::time::Instant::now();
+    let pak = aa_pak::Pak::global();
+    let mut seen: HashMap<String, Donor> = HashMap::new();
+    let mut worlds: Vec<String> = pak
+        .list("worlds/")
+        .filter_map(|n| {
+            let n = aa_pak::normalize(n);
+            let rest = n.strip_prefix("game/").unwrap_or(&n).strip_prefix("worlds/")?.to_string();
+            let (name, file) = rest.split_once('/')?;
+            (file == "world.g" && name != world).then(|| name.to_string())
+        })
+        .collect();
+    worlds.sort();
+    worlds.dedup();
+    for other in &worlds {
+        let Ok(w) = aa_world::world::World::load(other) else { continue };
+        for mut d in catalogue(other, w.cells.keys().copied()) {
+            if known.contains(&d.material) || seen.contains_key(&d.material) {
+                continue;
+            }
+            d.origin = Some(other.clone());
+            seen.insert(d.material.clone(), d);
+        }
+    }
+    let mut id = 9000;
+    let mut mtls: Vec<String> = pak.list("materials/aa_terrain/").map(key).filter(|k| k.ends_with(".mtl")).collect();
+    mtls.sort();
+    mtls.dedup();
+    for m in mtls {
+        let material = m.trim_end_matches(".mtl").to_string();
+        if known.contains(&material) || seen.contains_key(&material) {
+            continue;
+        }
+        let name = material.rsplit('/').next().unwrap_or(&material).to_string();
+        id += 1;
+        let element = format!(
+            "<SurfaceType Name=\"{name}\" DetailTexture=\"\" DetailScaleX=\"0.2\" DetailScaleY=\"0.2\" DetailMaterial=\"{material}\" ProjectAxis=\"2\" Bumpmap=\"\" ProjAxis=\"Z\" Id=\"{id}\"/>"
+        );
+        seen.insert(material.clone(), Donor { material, cell: (0, 0), slot: 0, element, origin: Some("pak".into()) });
+    }
+    let mut list: Vec<Donor> = seen.into_values().collect();
+    list.sort_by(|a, b| a.material.rsplit('/').next().cmp(&b.material.rsplit('/').next()));
+    info!("surface types: {} more materials from {} other worlds and the pak ({:.1} s)", list.len(), worlds.len(), started.elapsed().as_secs_f32());
     list
 }
 
@@ -224,6 +293,15 @@ fn build_catalogue(editor: Res<Editor>, world: Option<Res<WorldInfo>>, mut table
     tables.add.catalogue = Some(catalogue(&editor.world, world.0.cells.keys().copied()));
 }
 
+/// Fills the "more materials" list once that option is first ticked.
+fn build_more(editor: Res<Editor>, mut tables: ResMut<SurfaceTables>) {
+    if !tables.add.enabled || !tables.add.more || tables.add.more_list.is_some() {
+        return;
+    }
+    let Some(known) = tables.add.catalogue.as_ref().map(|c| c.iter().map(|d| d.material.clone()).collect()) else { return };
+    tables.add.more_list = Some(more_catalogue(&editor.world, &known));
+}
+
 /// `--paint-material <text>` (with `--add-surface`): the first catalogue material whose path contains `text`.
 pub fn find_material(tables: &mut SurfaceTables, world: &str, text: &str) -> Option<String> {
     if crate::flag("--add-surface") {
@@ -234,7 +312,49 @@ pub fn find_material(tables: &mut SurfaceTables, world: &str, text: &str) -> Opt
         tables.add.catalogue = Some(catalogue(world, w.cells.keys().copied()));
     }
     let text = text.to_ascii_lowercase();
-    tables.add.catalogue.as_ref()?.iter().find(|d| d.material.contains(&text)).map(|d| d.material.clone())
+    if let Some(m) = tables.add.catalogue.as_ref()?.iter().find(|d| d.material.contains(&text)) {
+        return Some(m.material.clone());
+    }
+    // not in this world: the other worlds' and the pak's materials
+    tables.add.more = true;
+    if tables.add.more_list.is_none() {
+        let known = tables.add.catalogue.as_ref()?.iter().map(|d| d.material.clone()).collect();
+        tables.add.more_list = Some(more_catalogue(world, &known));
+    }
+    tables.add.more_list.as_ref()?.iter().find(|d| d.material.contains(&text)).map(|d| d.material.clone())
+}
+
+/// Rebuilds the layer library (it reads the overlay's `leveldata.xml`, so it now has the added materials' textures) and
+/// reloads every terrain cell and the objects on them, once the paint stroke is over.
+fn redraw_terrain(world: &mut World) {
+    let pressed = world.get_resource::<ButtonInput<MouseButton>>().is_some_and(|m| m.pressed(MouseButton::Left));
+    let Some(mut tables) = world.get_resource_mut::<SurfaceTables>() else { return };
+    if !tables.add.redraw || pressed {
+        return;
+    }
+    tables.add.redraw = false;
+    tables.add.status = format!("{}; reloading the terrain with the new materials", tables.add.status);
+    reload_terrain(world);
+}
+
+/// Despawns the terrain cells and objects and forgets the layer library: the streamer loads them again (a same-world
+/// version of `aa_world::switch_world_data`, which skips the current world).
+pub fn reload_terrain(world: &mut World) {
+    let roots: Vec<Entity> = world.query_filtered::<Entity, With<aa_world::stream::CellRoot>>().iter(world).collect();
+    for e in roots {
+        if let Ok(e) = world.get_entity_mut(e) {
+            e.despawn();
+        }
+    }
+    world.resource_scope(|world, mut state: Mut<aa_world::objects::ObjectState>| state.unload_all(world));
+    crate::objects_extra::shape::drop_live_water(world);
+    if let Some(mut streamer) = world.get_resource_mut::<aa_world::stream::Streamer>() {
+        streamer.reset();
+    }
+    if let Some(mut layers) = world.get_resource_mut::<TerrainLayers>() {
+        layers.reset();
+    }
+    info!("surface types: terrain reloaded with a new layer library");
 }
 
 /// Gives the loaded materials of cells with added slots the donor's shader entry (again after a cell reloads).
@@ -263,6 +383,10 @@ fn apply_added(
     let mut keep = Vec::new();
     for i in std::mem::take(&mut tables.add.pending) {
         let (c, slot, donor) = tables.add.added[i].clone();
+        if donor.origin.is_some() {
+            // not in the layer arrays yet: `redraw_terrain` rebuilds them, the library then has this cell's entry itself
+            continue;
+        }
         let handles: Vec<Handle<TerrainMaterial>> =
             patches.iter().filter(|(p, _)| p.cell == c).map(|(_, m)| m.0.clone()).collect();
         let Some(src) = library.params(donor.cell, cfg.terrain_tint) else { continue };
@@ -299,6 +423,8 @@ fn window(mut contexts: EguiContexts, editor: Res<Editor>, mut brush: ResMut<Bru
     egui::Window::new("Add surface types").default_pos([1580.0, 640.0]).default_width(320.0).default_open(false).show(ctx, |ui| {
         let add = &mut tables.add;
         ui.checkbox(&mut add.enabled, "Paint adds the material to cells that lack it");
+        ui.checkbox(&mut add.more, "More materials: other worlds' and every aa_terrain material of the pak")
+            .on_hover_text("They paint at once; when the stroke ends the terrain reloads with their textures (a few seconds)");
         ui.small("The world's layer library already holds every material some cell uses; the cell's leveldata.xml gets the material as a new surface type (max 31) in the pak overlay.");
         if !add.status.is_empty() {
             ui.small(add.status.clone());
@@ -315,11 +441,19 @@ fn window(mut contexts: EguiContexts, editor: Res<Editor>, mut brush: ResMut<Bru
         });
         let filter = add.filter.to_ascii_lowercase();
         let mut pick = None;
+        let more = add.more_list.as_ref().filter(|_| add.more).into_iter().flatten();
+        if add.more && add.more_list.is_none() {
+            ui.label("reading the other worlds' surface types ...");
+        }
         egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-            for d in list.iter().filter(|d| filter.is_empty() || d.material.contains(&filter)) {
+            for d in list.iter().chain(more).filter(|d| filter.is_empty() || d.material.contains(&filter)) {
                 let name = d.material.rsplit('/').next().unwrap_or(&d.material);
                 let on = brush.paint.as_deref() == Some(d.material.as_str());
-                if ui.selectable_label(on, name).on_hover_text(format!("{}\nfrom cell {:03}_{:03}, slot {}", d.material, d.cell.0, d.cell.1, d.slot)).clicked() {
+                let (label, tip) = match &d.origin {
+                    None => (name.to_string(), format!("{}\nfrom cell {:03}_{:03}, slot {}", d.material, d.cell.0, d.cell.1, d.slot)),
+                    Some(o) => (format!("{name}  ({o})"), format!("{}\nfrom {o}; the terrain reloads to draw it after the stroke", d.material)),
+                };
+                if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
                     pick = Some(d.material.clone());
                 }
             }
@@ -365,6 +499,28 @@ mod tests {
         assert_eq!(dst.normal_uv[7 * PROJECTIONS + 2].x, 2.0);
         // a slot without textures stays "none"
         assert_eq!(dst.layers[(7 * PROJECTIONS) * ENTRY].x, -1.0);
+    }
+}
+
+#[cfg(test)]
+mod more {
+    /// Other worlds and the pak add materials main_world does not use, each with a usable element.
+    #[test]
+    fn more_materials() {
+        if !aa_pak::Pak::global().exists("worlds/main_world/world.g") {
+            return;
+        }
+        let w = aa_world::world::World::load("main_world").unwrap();
+        let known: std::collections::HashSet<String> = super::catalogue("main_world", w.cells.keys().copied()).into_iter().map(|d| d.material).collect();
+        let more = super::more_catalogue("main_world", &known);
+        assert!(more.len() > 50, "{} more materials", more.len());
+        assert!(more.iter().any(|d| d.origin.as_deref() == Some("pak")));
+        for d in &more {
+            assert!(!known.contains(&d.material));
+            let t = aa_world::terrain_layers::parse_surface_types(&format!("<L><SurfaceTypes>{}</SurfaceTypes></L>", d.element));
+            assert_eq!(t.len(), 1, "{}", d.element);
+            assert_eq!(super::key(&t[0].material), d.material);
+        }
     }
 }
 

@@ -20,7 +20,7 @@ screen. The game data comes from the fake game API of the aa-ui examples (`src/f
 
 | Screen | Scenario |
 |---|---|
-| Login | `ENTERED_LOGIN`. The English client hides the login window (`loginLocale.loginHide`: it logs in through a launcher), so only the widget tree has it. |
+| Login | `ENTERED_LOGIN`, then the login window is shown (the English client hides it: `loginLocale.loginHide`, it logs in through a launcher). Its widgets build with 0 errors and can be inspected, edited and written into the scripts, but `aa-ui` draws nothing for the login stage yet (0 quads, though the windows are visible at full alpha), so it can't be checked on screen. |
 | World select | three servers |
 | Character select | with or without the reference character |
 | Character create | race, gender and step 1-3, picked the way the reference capture did (button clicks) |
