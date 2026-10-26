@@ -260,7 +260,7 @@ fn dab(heights: &mut Heights, query: &TerrainQuery, tables: &mut SurfaceTables, 
             let rect = (lo.x as usize, lo.y as usize, hi.x as usize, hi.y as usize);
             let edited = match b.kind {
                 BrushKind::Paint => {
-                    let Some(slot) = b.paint.and_then(|m| tables.slot_of(world, c, m)) else { continue };
+                    let Some(slot) = b.paint.and_then(|m| crate::surface_add::slot_or_add(tables, world, c, m)) else { continue };
                     paint(&source, local, r, rect, slot)
                 }
                 BrushKind::Hole => {
@@ -516,7 +516,10 @@ fn scripted_edits(
     if let Some(p) = paint_at {
         let c = ((p.x / CELL_SIZE).floor() as i32, (p.y / CELL_SIZE).floor() as i32);
         let slot: usize = crate::arg("--paint-surface").and_then(|v| v.parse().ok()).unwrap_or(0);
-        let material = tables.get(&world, c).get(slot).cloned().flatten();
+        let material = match crate::arg("--paint-material") {
+            Some(name) => crate::surface_add::find_material(&mut tables, &world, &name),
+            None => tables.get(&world, c).get(slot).cloned().flatten(),
+        };
         match (material, heights.height_at(&query, p.x, p.y)) {
             (Some(m), Some(z)) => {
                 brush.paint = Some(m.clone());

@@ -28,6 +28,7 @@
 //! * `--row <npcs|doodads|items|quests>:<id>` open that database row in the row editor
 //! * checks: `--sculpt x,y` holds the terrain brush there for 120 frames (`--brush-radius`, `--brush-strength`),
 //!   `--sculpt-save` then saves the terrain
+//! * `--preview <npcs|doodads|items|quests>:<id>` open the model preview with that row
 //! * `--export-pak <game_pak>` exports the pak overlay into that pak at startup ([`pak_export`]; never `D:/AA1.2`)
 //!
 //! Controls: hold the right mouse button to look, WASD / Space / Ctrl to fly (Shift fast), left click to select or
@@ -41,6 +42,10 @@ mod camera;
 mod db;
 mod heightmap_write;
 mod jsonc;
+mod model_preview;
+mod navmesh;
+mod objects_extra;
+mod surface_add;
 mod pak_export;
 mod npc_look;
 mod play;
@@ -238,6 +243,9 @@ fn main() {
         .add_plugins((camera::plugin, tools::plugin, views::plugin, terrain_edit::plugin, server_terrain::plugin, ui::plugin, play::plugin, play_server::plugin))
         .add_plugins(pak_export::plugin)
         .add_plugins(world_objects::plugin)
+        .add_plugins(surface_add::plugin)
+        .add_plugins(objects_extra::plugin)
+        .add_plugins(model_preview::plugin)
         .add_systems(Startup, move |mut commands: Commands| {
             let transform = Transform::from_translation(cry_to_bevy(start))
                 .with_rotation(Quat::from_rotation_y(0.0) * Quat::from_rotation_x(-0.35));

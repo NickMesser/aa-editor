@@ -180,7 +180,7 @@ fn drag(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn keys(
+pub(crate) fn keys(
     keys: Res<ButtonInput<KeyCode>>,
     scroll: Res<AccumulatedMouseScroll>,
     mouse: Res<ButtonInput<MouseButton>>,

@@ -45,7 +45,9 @@ pub struct PaletteEntry {
 /// `DetailMaterial` of every slot of a cell (`None`: unused slot), read from `leveldata.xml` once per cell.
 #[derive(Resource, Default)]
 pub struct SurfaceTables {
-    cells: HashMap<(i32, i32), Arc<Vec<Option<String>>>>,
+    pub(crate) cells: HashMap<(i32, i32), Arc<Vec<Option<String>>>>,
+    /// Painting materials a cell does not list yet ([`crate::surface_add`]).
+    pub add: crate::surface_add::AddState,
 }
 
 impl SurfaceTables {

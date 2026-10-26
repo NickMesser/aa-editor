@@ -189,6 +189,39 @@ impl Previewer<'_, '_> {
             .ok()
     }
 
+    /// A weapon model on its own (`item_assets.path`: one `.cgf`, or a `.cdf` carrier with its parts).
+    pub fn spawn_weapon(&mut self, commands: &mut Commands, path: &str) -> Option<Entity> {
+        let mut parts = Vec::new();
+        for (file, material) in weapon_files(path) {
+            let options = ModelOptions { material, shading: aa_cry::scene::Shading::Full, ..default() };
+            let Ok(loaded) = self.cry.load_model(&file, &options) else { continue };
+            parts.push(spawn_loaded(commands, &file, &loaded, &options));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(commands.spawn((Name::new(path.to_string()), Transform::IDENTITY, Visibility::default())).add_children(&parts).id())
+    }
+
+    /// Whether armour item `item` has meshes for the default body of `race` / `gender`.
+    pub fn wears(&self, race: Race, gender: Gender, item: u32) -> bool {
+        let Some(game) = self.game else { return false };
+        let Ok(desc) = CharacterDesc::default_for(game, race, gender) else { return false };
+        let pak = aa_pak::Pak::global();
+        game.item_visuals(item, desc.model_id()).is_ok_and(|v| !v.is_empty() && v.iter().all(|x| pak.exists(&x.path)))
+    }
+
+    /// The default `race` / `gender` body wearing armour `items` (and nothing else).
+    pub fn spawn_dressed(&mut self, commands: &mut Commands, race: Race, gender: Gender, items: Vec<u32>) -> Option<Entity> {
+        let game = self.game?;
+        let mut desc = CharacterDesc::default_for(game, race, gender).ok()?;
+        desc.costume = aa_anim::Costume::Items(items);
+        let assets = desc.resolve(game).map_err(|e| debug!("dressed preview {race:?} {gender:?}: {e}")).ok()?;
+        aa_anim::spawn_character(commands, self.cry, self.clips, assets, Transform::IDENTITY)
+            .map_err(|e| debug!("dressed preview {race:?} {gender:?}: {e}"))
+            .ok()
+    }
+
     /// Hangs `items` on the bones of the character `root` once its skeleton exists ([`attach_carried`]).
     pub fn carry(commands: &mut Commands, root: Entity, items: Vec<crate::npc_look::Carried>) {
         if !items.is_empty() {

@@ -10,6 +10,7 @@ use crate::camera::{EditorCamera, FlySpeed};
 use crate::db::{Field, GameData, Table, component_kind};
 use crate::spawns::{Kind, SpawnStore};
 use crate::terrain_edit::{Brush, BrushKind, Heights};
+use crate::model_preview::{ModelPreview, Subject};
 use crate::tools::Cursor;
 use crate::{Editor, Mode, Request};
 
@@ -96,7 +97,7 @@ fn save_spawns(mut editor: ResMut<Editor>, mut store: ResMut<SpawnStore>, game: 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn panels(
+pub(crate) fn panels(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
     mut store: ResMut<SpawnStore>,
@@ -109,6 +110,7 @@ fn panels(
     diagnostics: Res<DiagnosticsStore>,
     cam: Query<(&Camera, &GlobalTransform), With<EditorCamera>>,
     mut area: ResMut<UiArea>,
+    mut preview: ResMut<ModelPreview>,
     mut fonts: Local<bool>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
@@ -142,11 +144,11 @@ fn panels(
     );
     let ppp = ctx.pixels_per_point();
     let mut push = |r: egui::Rect| area.rects.push(egui::Rect::from_min_max((r.min.to_vec2() * ppp).to_pos2(), (r.max.to_vec2() * ppp).to_pos2()));
-    push(menu_bar(&mut root, &mut editor, &mut store, &heights, fps));
+    push(menu_bar(&mut root, &mut editor, &mut store, &heights, &mut preview, fps));
     push(status_bar(&mut root, &editor, &store, &heights, &cursor, &cam));
-    push(browser(&mut root, &mut editor, &game));
+    push(browser(&mut root, &mut editor, &game, &mut preview));
     push(inspector(&mut root, &mut editor, &mut store, &game, &mut brush, &mut clock, &mut speed));
-    row_editor(ctx, &mut editor, &mut game, &store);
+    row_editor(ctx, &mut editor, &mut game, &store, &mut preview);
     labels(ctx, &editor, &store, &game, &cursor, &cam);
     Ok(())
 }
@@ -162,7 +164,7 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, heights: &Heights, fps: f64) -> egui::Rect {
+fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, heights: &Heights, preview: &mut ModelPreview, fps: f64) -> egui::Rect {
     egui::Panel::top("menu").show(root, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("File", |ui| {
@@ -208,6 +210,9 @@ fn menu_bar(root: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStore, he
             if ui.button("Play on server").clicked() {
                 editor.requests.push(Request::PlayOnServer);
             }
+            if ui.selectable_label(preview.open, "Model preview").on_hover_text("A turntable view of the row under the pointer, the open row or the selected spawn").clicked() {
+                preview.open = !preview.open;
+            }
             ui.separator();
             let unsaved = store.changed_count() + heights.unsaved.len();
             if unsaved > 0 {
@@ -249,7 +254,7 @@ fn status_bar(
     .rect
 }
 
-fn browser(root: &mut egui::Ui, editor: &mut Editor, game: &GameData) -> egui::Rect {
+fn browser(root: &mut egui::Ui, editor: &mut Editor, game: &GameData, preview: &mut ModelPreview) -> egui::Rect {
     egui::Panel::left("browser").resizable(true).default_size(300.0).show(root, |ui| {
         ui.heading("Browser");
         ui.horizontal(|ui| {
@@ -284,6 +289,9 @@ fn browser(root: &mut egui::Ui, editor: &mut Editor, game: &GameData) -> egui::R
                     let placing = editor.place.is_some_and(|(k, id)| id == e.id && matches!((k, editor.browser), (Kind::Npc, Table::Npcs) | (Kind::Doodad, Table::Doodads)));
                     let open = editor.row.as_ref().is_some_and(|r| r.table == editor.browser && r.id == e.id);
                     let label = ui.selectable_label(placing || open, format!("{:>6}  {}", e.id, e.name));
+                    if label.hovered() {
+                        preview.hover = Some(Subject::of_row(editor.browser, e.id));
+                    }
                     let label = if !e.model.is_empty() { label.on_hover_text(&e.model) } else { label };
                     if label.clicked() {
                         match editor.browser {
@@ -509,7 +517,7 @@ fn selection_panel(ui: &mut egui::Ui, editor: &mut Editor, store: &mut SpawnStor
     });
 }
 
-fn row_editor(ctx: &egui::Context, editor: &mut Editor, game: &mut GameData, store: &SpawnStore) {
+fn row_editor(ctx: &egui::Context, editor: &mut Editor, game: &mut GameData, store: &SpawnStore, preview: &mut ModelPreview) {
     let Some(mut row) = editor.row.take() else { return };
     let mut open = true;
     let mut status = None;
@@ -560,6 +568,9 @@ fn row_editor(ctx: &egui::Context, editor: &mut Editor, game: &mut GameData, sto
                         }
                         Err(e) => status = Some(format!("clone failed: {e:#}")),
                     }
+                }
+                if ui.button("Preview").on_hover_text("Show this row in the model preview").clicked() {
+                    preview.request = Some(Subject::of_row(row.table, row.id));
                 }
                 ui.checkbox(&mut row.confirm_delete, "");
                 if ui.add_enabled(game.writable && row.confirm_delete, egui::Button::new("Delete row")).on_hover_text("Tick the box first").clicked() {

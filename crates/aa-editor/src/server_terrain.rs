@@ -96,7 +96,7 @@ pub fn export(
 }
 
 /// Copies an existing file to `<name>.editor-orig` the first time it is overwritten. True when it made the copy.
-fn backup(path: &Path) -> Result<bool> {
+pub(crate) fn backup(path: &Path) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
@@ -162,13 +162,19 @@ fn run_export(editor: Res<Editor>, heights: Res<Heights>, mut st: ResMut<ServerT
         }
         Ok(r)
     });
+    let nav = result.is_ok().then(|| crate::navmesh::export(&editor.world, &heights.edited, &source, Some(&editor.paths.overlay)));
     st.status = match result {
         Ok(r) => format!(
-            "server terrain: {} cell(s) -> {} ({} backed up{}). Restart the server.",
+            "server terrain: {} cell(s) -> {} ({} backed up{}). {}Restart the server.",
             r.cells,
             source.display(),
             r.backed_up,
-            if r.registered { ", client source added to the server config" } else { "" }
+            if r.registered { ", client source added to the server config" } else { "" },
+            match nav {
+                Some(Ok(n)) => format!("Navmesh: {} file(s), {} point(s) moved, {} off the ground kept, {} link(s) blocked over holes. ", n.files, n.moved, n.kept, n.blocked_links),
+                Some(Err(e)) => format!("Navmesh update failed: {e:#}. "),
+                None => String::new(),
+            }
         ),
         Err(e) => format!("server terrain export failed: {e:#}"),
     };
@@ -188,7 +194,7 @@ fn window(mut contexts: EguiContexts, editor: Res<Editor>, heights: Res<Heights>
         if ui.add_enabled(edited > 0, egui::Button::new(format!("Export terrain to server ({edited} cell(s))"))).clicked() {
             st.requested = true;
         }
-        ui.small("Restart the Rust game server afterwards. The navmesh (.bai) is not regenerated.");
+        ui.small("Restart the Rust game server afterwards. Navmesh (.bai) heights follow the edit; its triangles are not rebuilt.");
         if !st.status.is_empty() {
             ui.separator();
             ui.small(st.status.clone());
@@ -262,7 +268,7 @@ mod tests {
     }
 
     fn scratch() -> PathBuf {
-        PathBuf::from("C:/Users/messe/aa-editor-scratch/server")
+        std::env::temp_dir().join("aa-editor-test-server")
     }
 
     #[test]
@@ -339,7 +345,7 @@ mod tests {
         let empty = with_source("{\"Sources\": []}", dir).unwrap().unwrap();
         assert_eq!(empty, "{\"Sources\": [ \"D:/x/Data/ClientOverlay\"]}");
 
-        let file = scratch().join("test/Config.Local.json");
+        let file = scratch().join("test_config/Config.Local.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, config).unwrap();
         let _ = std::fs::remove_file(file.with_file_name("Config.Local.json.editor-orig"));

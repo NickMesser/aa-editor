@@ -97,7 +97,7 @@ impl Default for WorldObjects {
 
 impl WorldObjects {
     /// The cell's edit state, read from its files on first use (needs the streamer's data of the cell).
-    fn ensure(&mut self, world: &str, state: &ObjectState, c: (i32, i32)) -> Option<&mut EditCell> {
+    pub(crate) fn ensure(&mut self, world: &str, state: &ObjectState, c: (i32, i32)) -> Option<&mut EditCell> {
         if !self.cells.contains_key(&c) {
             let data = state.cell_data(c)?;
             let cell = EditCell::load(world, c, &data.objects);
@@ -771,7 +771,7 @@ fn draw(
     gizmos.line(base, base + Vec3::Y * 2.0, color);
 }
 
-fn save_requests(mut editor: ResMut<Editor>, mut objs: ResMut<WorldObjects>) {
+pub(crate) fn save_requests(mut editor: ResMut<Editor>, mut objs: ResMut<WorldObjects>) {
     let Some(i) = editor.requests.iter().position(|r| matches!(r, Request::SaveObjects)) else { return };
     editor.requests.remove(i);
     let (world, overlay) = (editor.world.clone(), editor.paths.overlay.clone());

@@ -18,6 +18,9 @@ cargo test -p aa-editor
 | Game data: NPC, doodad, item and quest rows and their English names | `--db`, default the lane's copy `D:/aaemu-live-bevy/rs-game/Data/compact.sqlite3`. It falls back to the shared copy, read-only. | the same database: UPDATE, clone (`MAX(id)+1`, texts copied) and delete in one transaction each |
 | Terrain heights, surface types, holes; cover colour | the pak (plus the overlay) | `heightmap.dat` (and `cover.ctc` when tinted) per edited cell in the pak overlay `--overlay`, default `data/local/editor/overlay/worlds/<world>/cells/XXX_YYY/client/terrain/` |
 | Static world objects (brushes, vegetation, entity props) | the cell's `brush.dat`, `object.dat`, `vegetation.dat`, `vegetation/SX_SY.dat`, `entities.xml` (pak plus overlay) | the edited files of each cell in the pak overlay, `<overlay>/worlds/<world>/cells/XXX_YYY/client/`, same binary formats (see "World objects") |
+| New objects; decals, roads, water volumes, interior brushes | the same files plus `statobjs.dat` and `visareas.dat` | the same overlay folder (see "More objects") |
+| New surface types of a cell | the cell's `leveldata.xml` | `<overlay>/worlds/<world>/cells/XXX_YYY/client/leveldata.xml` (see "Adding surface types") |
+| Server navmesh heights | `game/worlds/<world>/paths/XXX_YYY/*.bai` from the pak | with "Export terrain to server": `<server-data>/ClientOverlay/game/worlds/...` and `<overlay>/worlds/...` (see "Server terrain") |
 
 The server loads spawns and game data once, at startup. Restart the lane's game server after saving.
 
@@ -71,12 +74,28 @@ keeps reading them from the pak.
 **Restart the Rust game server** afterwards (config and cells are read at start; cells are cached once loaded).
 To undo, delete the `ClientOverlay` folder (and restore `Config.Local.json.editor-orig`).
 
-**Navmesh.** `.bai` files (`game/worlds/<world>/paths/XXX_YYY/*.bai`) are baked by the CryEngine tools and the server
-only reads them (`systems/ai/geodata/manager.rs:186,431`); no generator exists. With `GeoDataMode: true`
-(`Configurations/World.json`, on in the lane) `AiGeoData::get_height` returns the navmesh node height first and falls
-back to the heightmap only where no navmesh node exists. So over edited ground that has navmesh the server still uses
-the old Z for NPCs and A* paths. Either accept that, or set `GeoDataMode` to `false` (NPCs then use the heightmap and
-lose A* pathing).
+**Navmesh.** `.bai` files (`game/worlds/<world>/paths/XXX_YYY/*.bai`, 256 m blocks, 4 x 4 per cell) are baked by the
+CryEngine tools and the server only reads them (`systems/ai/geodata/manager.rs:186,431`, format in `geodata/bai.rs`).
+With `GeoDataMode: true` (`Configurations/World.json`, on in the lane) `AiGeoData::get_height` answers from the
+navmesh triangles / nodes first, so the editor moves the navmesh with the ground (`navmesh.rs`):
+
+* After a successful "Export terrain to server", every `netmission*.bai` and `vertsmission*.bai` of the blocks of
+  each edited cell is read from the **original** pak bytes (`Pak::read_packed`, never an earlier export) and patched in
+  place. A point that sat on the original ground (within 1.5 m of the pak heightmap) gets `Z += new - old` ground
+  height at its XY: netmission node positions, link edge centres and the block bbox Z; vertsmission vertices. Points
+  off the ground (bridges, decks, caves) keep their Z. Shifts under 5 cm are ignored: the heightmap writer
+  re-quantises every sector by about 1 cm.
+* A link that touches a node over a **new** hole gets `max_pass_radius = -1` (blocked).
+* Only changed files are written, lowercase, to `<server-data>/ClientOverlay/game/worlds/<world>/paths/XXX_YYY/` and to
+  the pak overlay (so a pak export carries them), each with `.editor-orig` when a file is overwritten the first time.
+  Everything except the patched Z / radius fields stays byte-identical (checked: 0 other bytes differ).
+* **Not updated:** the navmesh's topology. No triangles, nodes or links are added or removed, `areasmission*.bai`
+  is not touched, and walls / slopes you sculpt do not block paths. Raised ground with no navmesh under it stays
+  unwalkable for A*, and a cliff sculpted across a navmesh still has links across it. For large reshaping set
+  `GeoDataMode` to `false` (NPCs then use the heightmap and lose A* pathing).
+* Status line: "Navmesh: N file(s), P point(s) moved, K off the ground kept, L link(s) blocked over holes".
+  Tests `navmesh::tests`: untouched files stay byte-identical and most points lie on the ground (main_world and
+  instance_prologue); a synthetic block with a bridge and a hole.
 
 ## Tools
 
@@ -97,6 +116,15 @@ lose A* pathing).
   cell under it gets the slot naming that `DetailMaterial` (`game/` prefix and case ignored); cells without it keep
   theirs. Holes are never painted over. The cell's `R8Uint` surface map (owned by its `TerrainMaterial`) is
   overwritten in place and the material touched, so no material, mesh or array is rebuilt.
+* **Adding surface types** (`surface_add.rs`, window "Add surface types" next to the Paint panel, or
+  `--add-surface`). Tick "add missing surface types" and pick any material of the world (317 in main_world: the
+  distinct `DetailMaterial`s of all cells, each with the cell it comes from). Painting it into a cell that lacks it
+  appends a copy of that `<SurfaceType .../>` to the cell's `<SurfaceTypes>` (new slot = the old count; a cell with 31
+  is refused) and writes `leveldata.xml` to the overlay at once. The world's layer library already holds every
+  material some cell uses, so no texture is added: the loaded cell's shader table gets the donor's entry for the new
+  slot (uv offsets recomputed for this cell) and the material shows immediately; after a restart the library reads the
+  overlay's `leveldata.xml`. A material no cell of the world uses cannot be added. Checks: `--paint-material <name
+  part>` paints that material with `--paint x,y` and turns `--add-surface` on.
 * **Hole.** Sets samples to 31 (Shift or "fill holes" fills them again with the pak's surface, else a neighbour's).
   The sector's `hasHoles` gate follows (cut: on; fill: off when no hole is left), the patch meshes of the touched
   sectors are rebuilt (`build_patch_mesh` cuts the quads). `Heights::raycast` passes through holes,
@@ -139,7 +167,8 @@ Before / after: [`screenshots/hole_before.jpg`](screenshots/hole_before.jpg), [`
 `world_objects/` (Objects mode, key 4). Editable: **brushes** (`brush.dat`, or the `object.dat` octree in cells
 without one), **vegetation** (`vegetation.dat`, the octree's own instances, the dense-forest `vegetation/SX_SY.dat`)
 and **static entity props** (`entities.xml` GeomEntity / BasicEntity / AnimObject / sleeping RigidBodyEx with a unique
-`EntityGuid`). Read-only: interior objects of `visareas.dat`, playing animated CGAs, decals, roads, water, voxels.
+`EntityGuid`). Decals, roads, water volumes, interior brushes and new objects are in the window "More objects" (below).
+Read-only: playing animated CGAs, voxels.
 
 * **Pick.** A ray against the oriented boxes of the drawn mesh parts. `aa-world` puts
   `objects::edit::ObjectPart { cell, kind, index }` on every spawned part; `index` is into the cell's `CellObjects`.
@@ -167,6 +196,51 @@ and **static entity props** (`entities.xml` GeomEntity / BasicEntity / AnimObjec
 * Checks: `--select-object x,y [--select-kind brush|vegetation|entity]` selects the nearest editable object of the
   cell and focuses it; after 6 s `--move-selected-object dx,dy,dz`, `--delete-selected-object`, `--objects-save`.
 
+### More objects
+
+`objects_extra.rs`. In Objects mode the button "More objects" at the bottom (or `--more-objects`) opens a window for
+the cell under the cursor:
+
+* **New model / New vegetation.** A searchable list of the pak's 10,055 `objects/**.cgf` models (LODs left out), or
+  the world's vegetation groups. The picked model follows the cursor as a ghost (`[` `]` turn); a click places it
+  (Shift keeps placing, Esc stops). A brush goes into `brush.dat` (the model is appended to `statobjs.dat`, written at
+  once, and to `object.dat`'s model table, so both tables keep their order; an existing entry is reused) or into the
+  `object.dat` octree in cells without `brush.dat`. The record is a copy of one of the cell's records with model,
+  matrix, box (the model's LOD 0 bounds) and material -1 (the model's own `.mtl`). Vegetation copies a
+  `vegetation.dat` record with the group set. The new object is then an ordinary world object (select, drag, turn,
+  delete, Ctrl+S). There is no separate preview pane: the ghost in the world is the preview ("Model preview" shows
+  database rows only).
+* **Decals, Roads, Water** (`object.dat` item types 9, 13, 11). The list shows the cell's objects with coloured
+  outlines; the selected one is white. Move (X / Y / Z buttons by a step) or delete. A move shifts the whole object:
+  box, position, road spline points, water outline points and the water plane. The octree the Objects tools save is
+  edited, so untouched bytes stay the same. The streamer builds these meshes once per cell, so the outline moves at
+  once and the drawn geometry after Ctrl+S and **Reload objects** (drops every loaded cell's objects and reads them
+  again from pak + overlay) or a restart.
+* **Interior brushes** (`visareas.dat`). Each area / portal record holds its own small octree. Its brushes are matched
+  to the drawn brushes by model and position; they move and delete like the others, and the drawn brush follows at
+  once. `visareas.dat` is written next to the cell's other files on Ctrl+S (record lengths and the header's compiled
+  size recomputed, everything else verbatim). Parse -> write is byte-identical (tests `visareas_round_trip`, every
+  25th main_world file, and `other_worlds_round_trip`).
+* Checks: `--place-model <game/objects/...cgf | veg:<group>> --place-at x,y[,z]` places one object 8 s after start;
+  `--extra-move <decal|road|water|interior>[#n]:dx,dy,dz` moves the n-th object of that kind in the camera's cell (no
+  numbers: deletes it); add `--objects-save` to save.
+* Not editable: decal / road / water shapes (whole-object moves only), new decals / roads / water, voxels, and the
+  area / portal shapes of `visareas.dat` (only its brushes). The octree node boxes are not refitted after a move.
+
+## Worlds checked
+
+The tools assume only the cell / block layout, so any world in `game/worlds/` loads (`--world <name>` with
+`--spawn-dir <copy of Data/Worlds/name>`). Checked:
+
+| World | What was run |
+|---|---|
+| `main_world` | everything (all features were built on it) |
+| `instance_library` (interior dungeon) | loads and renders (25-30 fps, dev build); an interior bookshelf deleted, saved and still gone after a restart; a new model placed in a `brush.dat` cell, saved and reloaded |
+| `instance_prologue` (island, 4 cells) | loads (70-80 fps); sculpt, save and "Export terrain to server" with the navmesh (2 files patched, only Z bytes changed); navmesh offsets checked by a test |
+| `instance_sal_temple`, `arche_mall_world` (and the two above) | every `object.dat` and readable `visareas.dat` round-trips byte-identical (test `other_worlds_round_trip`) |
+
+Only Windows was used.
+
 ## Previews
 
 `preview.rs` is simplified from aa-client's `ingame::{creature, doodad_model, housing::prefab}`, which are binary-only
@@ -182,6 +256,32 @@ there:
 
 Models load nearest first, within a 12 ms budget per frame. Spawns within the view radius (default 220 m) are shown;
 the rest wait until the camera gets close.
+
+## Model preview
+
+Menu bar "Model preview" (or `--preview <npcs|doodads|items|quests>:<id>`, which opens it on that row) shows a
+turntable render of one row. Code: `crates/aa-editor/src/model_preview.rs`.
+
+* **What it shows.** With "follow" ticked: the browser row the pointer rests on (0.3 s), else a row just opened in the
+  row editor ("Preview" there forces it), else a spawn just selected in the world. Untick "follow" to keep the current
+  model.
+* **NPCs:** the same model as the world (the dressed humanoid with its carried weapons, a creature with its idle
+  animation, a static model or prefab), scaled by `npcs.scale`.
+* **Doodads:** the `.cgf` or the prefab's parts.
+* **Items:** the icon (`items.icon_id` -> `icons.filename` under `ui/icon/`) plus:
+  * weapons: `item_weapons` -> `item_assets.path` (a `.cgf`, or a `.cdf` carrier with its parts), stood up on its
+    longest axis;
+  * armour and clothing: worn on the default body of the race / gender picked in the window and nothing else. When
+    that body has no meshes for the item, the first race / gender that has them is used, and the note says so;
+  * other items: the icon only.
+* **Quests:** the NPC who gives the quest (`quest_acts` `QuestActConAcceptNpc`), else the one it is turned in to
+  (`QuestActConReportNpc`), else the first `quest_components.npc_id`.
+* **View.** Drag to orbit, wheel to zoom, "turn" spins it, "Reset view" refits. The camera frames the model's mesh
+  bounds. Skinned bodies have none, so their bones stand in for them.
+* **How it renders.** The models spawn at the origin on render layer 7. Only the preview camera (a 640 x 640 image
+  shown in the window, with its own ambient light) and its two directional lights see that layer, so nothing shows in
+  the world view and the world's sun, fog and post effects stay off it. The camera is active only while the window is
+  open, and a model is loaded only then.
 
 ## Coordinates
 
@@ -217,10 +317,16 @@ aa-client has no start-position flag that reaches the server (`--pos x,y[,z]` mo
 
 ## Gaps
 
-* Decals, roads, water volumes and interior (`visareas.dat`) objects cannot be edited; no new objects from a model
-  browser yet (only copies). The octree node boxes of `object.dat` are not refitted after a move.
-* Painting cannot add a surface type a cell does not list (that needs its `leveldata.xml` and the layer library).
-  Surface painting changes the detail layer only; the cover colour needs the Tint brush.
-* The server's navmesh (`paths/*.bai`, baked into the pak) is not regenerated. With `GeoDataMode` on it still answers
-  heights over navmesh-covered ground (see "Server terrain").
+* Decals, roads and water can only be moved or deleted as a whole: no reshaping, no new ones. Moved ones draw in
+  their new place after "Reload objects" or a restart. The octree node boxes of `object.dat` are not refitted after a
+  move. Area and portal shapes of `visareas.dat` are not editable.
+* A new surface type must be a material some cell of the same world already uses (no new textures). Surface painting
+  changes the detail layer only; the cover colour needs the Tint brush.
+* The navmesh follows height edits only: no new triangles or links, and sculpted walls do not block paths (see
+  "Server terrain").
+* Worlds checked: main_world, instance_library, instance_prologue, plus a round-trip test over two more. The others
+  are untested. Windows only.
 * Play (F5) runs inside the editor, without the server: no NPC AI, no quests. "Play on server" (below) runs the real client against the lane server for that.
+* Model preview: armour is shown alone on a bare body, without the rest of a set. Static world objects (brushes,
+  vegetation) are not previewed; select their spawn or row instead. Rigid bone attachments of creatures are missing,
+  as they are in the world.

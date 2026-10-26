@@ -375,6 +375,71 @@ impl GameData {
         Ok(())
     }
 
+    /// The model of weapon item `id` (`item_weapons` -> `item_assets.path`: a `.cgf` or a `.cdf` carrier).
+    pub fn item_weapon(&self, id: u32) -> Option<String> {
+        self.lock()
+            .query_row(
+                "SELECT ia.path FROM item_weapons w JOIN item_assets ia ON ia.id = w.asset_id WHERE w.item_id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|p| norm(&p))
+            .filter(|p| p.contains('.'))
+    }
+
+    /// Whether item `id` is armour or clothing (`item_armors`).
+    pub fn item_is_armor(&self, id: u32) -> bool {
+        self.lock().query_row("SELECT 1 FROM item_armors WHERE item_id = ?1", params![id], |_| Ok(())).is_ok()
+    }
+
+    /// The pak path of item `id`'s icon (`items.icon_id` -> `icons.filename` under `ui/icon/`).
+    pub fn item_icon(&self, id: u32) -> Option<String> {
+        self.lock()
+            .query_row(
+                "SELECT ic.filename FROM items i JOIN icons ic ON ic.id = i.icon_id WHERE i.id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| format!("ui/icon/{}", f.trim().to_ascii_lowercase()))
+    }
+
+    /// The NPC that stands for a quest, with its role: the one who gives it (`QuestActConAcceptNpc`), else the one it
+    /// is turned in to (`QuestActConReportNpc`), else the first step that names one (`quest_components.npc_id`).
+    pub fn quest_npc(&self, quest: u32) -> Option<(u32, &'static str)> {
+        let conn = self.lock();
+        for (detail, table, role) in [
+            ("QuestActConAcceptNpc", "quest_act_con_accept_npcs", "gives the quest"),
+            ("QuestActConReportNpc", "quest_act_con_report_npcs", "takes the quest in"),
+        ] {
+            let npc: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT n.npc_id FROM quest_components c JOIN quest_acts a ON a.quest_component_id = c.id \
+                         JOIN {table} n ON n.id = a.act_detail_id WHERE c.quest_context_id = ?1 AND a.act_detail_type = ?2 \
+                         AND n.npc_id > 0 ORDER BY c.id LIMIT 1"
+                    ),
+                    params![quest, detail],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(npc) = npc {
+                return Some((npc as u32, role));
+            }
+        }
+        conn.query_row(
+            "SELECT npc_id FROM quest_components WHERE quest_context_id = ?1 AND npc_id > 0 ORDER BY id LIMIT 1",
+            params![quest],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|n| (n as u32, "named by a step"))
+    }
+
     /// The steps of a quest (`quest_components`): id, kind, NPC with name.
     pub fn quest_components(&self, quest: u32) -> Vec<(u32, u32, u32, String)> {
         let conn = self.lock();
