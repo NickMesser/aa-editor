@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/aa-editor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# The engine crates come from the client remake, pinned to the commit this editor was built against.
+[workspace.dependencies]
+aa-pak = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-dev = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-cry = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-anim = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+aa-world = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }
+
+bevy = { version = "0.20", default-features = false, features = ["2d", "3d", "ui", "dds", "tga", "jpeg"] }
+anyhow = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Bevy's recommended dev setup: our code lightly optimised, dependencies fully optimised.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+debug = "line-tables-only"
+
+# The remake patches bevy_render (browser pipeline compilation; native code is unchanged). Use the same copy so
+# the engine crates and the editor agree on one bevy_render.
+[patch.crates-io]
+bevy_render = { git = "https://github.com/NickMesser/AABevy1.2", rev = "17d6258a1bca978c61830354b9e9832d08f0eea8" }

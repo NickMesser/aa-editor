@@ -1,0 +1,19 @@
+[package]
+name = "aa-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "World editor for the ArcheAge 1.2 remake: terrain, NPC / doodad placement, quests, items, play preview"
+
+[dependencies]
+bevy = { workspace = true, features = ["png"] }
+bevy_egui = { version = "0.43", default-features = false, features = ["render", "default_fonts"] }
+aa-dev.workspace = true
+aa-pak.workspace = true
+aa-cry.workspace = true
+aa-anim.workspace = true
+aa-world.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
